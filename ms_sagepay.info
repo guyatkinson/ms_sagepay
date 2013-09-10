@@ -1,0 +1,10 @@
+;$Id$
+name = SagePay Server
+description = Payment Gateway for SagePay Server
+version = "7.x-2.x-dev"
+core = 7.x
+package = MoneyScripts - Gateways
+
+dependencies[] = ms_core
+files[] = ms_sagepay.install
+files[] = ms_sagepay.module

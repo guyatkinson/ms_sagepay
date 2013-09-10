@@ -1,0 +1,217 @@
+<?php
+// $Id: $
+
+/**
+ * @file
+ */
+ 
+
+/**
+ * Implements hook_requirements().
+ */
+function ms_sagepay_requirements($phase) {
+  $t = get_t();
+  $requirements = array();
+  $has_curl = function_exists('curl_init');
+
+  if (!$has_curl) {
+    $requirements['ms_sagepay_curl'] = array(
+      'title' => $t('cURL'),
+      'value' => $has_curl ? $t('Enabled') : $t('Not found'),
+    );
+    $requirements['ms_sagepay_curl']['severity'] = REQUIREMENT_ERROR;
+    $requirements['ms_sagepay_curl']['description'] = $t("The Sagepay gateway requires the PHP <a href='!curl_url'>cURL</a> library.", array('!curl_url' => 'http://php.net/manual/en/curl.setup.php'));
+  }
+
+  return $requirements;
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function ms_sagepay_uninstall() {
+  // Delete related variables all at once.
+  db_delete('variable')
+    ->condition('name', 'ms_sagepay_%%', 'LIKE')
+    ->execute();
+}
+
+/**
+ * Implements hook_schema().
+ * 
+ * NB As of Drupal 7.10, db_query, fetchObject, fetchAssoc etc return the field names in lower case,
+ *   whereas drupal_write_record is case significant for field names (at least for an array).
+ *   So, for now, we keep all field names in lower case, both in the schemas and the code referring to these fields.
+ */
+function ms_sagepay_schema() {
+  require_once DRUPAL_ROOT . '/' . drupal_get_path('module', 'ms_sagepay') . '/includes/ms_sagepay_constants.php';
+
+  $schema['ms_sagepay_payment_profiles'] = array(
+    'description' => 'Holds Customer Payment Profiles',
+    'fields' => array(
+      'id' => array(
+        'description' => 'The unique ID.',
+        'type' => 'serial',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'uid' => array(
+        'description' => 'The user ID.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'is_default' => array(
+        'description' => 'Whether or not this profile is the default.',
+        'type' => 'int',
+        'size' => 'tiny',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'original_vendortxcode' => array(
+        'type' => 'varchar',
+        'description' => 'Unique VendorTxCode for the original PAYMENT transaction.',
+        'length' => '40',
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'card_type' => array(
+        'type' => 'varchar',
+        'description' => 'Type of card, e.g. VISA, MC etc.',
+        'length' => '15',
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'card_last_4_digits' => array(
+        'type' => 'varchar',
+        'description' => 'Last 4 digits of the card number.',
+        'length' => '4',
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'first_name' => array(
+        'type' => 'varchar',
+        'description' => 'First Name of the Purchaser',
+        'length' => MAX_Firstnames,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'last_name' => array(
+        'type' => 'varchar',
+        'description' => 'Surname of the Purchaser',
+        'length' => MAX_Surname,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'billing_address' => array(
+        'type' => 'text',
+        'description' => 'Billing address for the credit card.',
+        'serialize' => TRUE,
+      ),
+    ),
+    'indexes' => array(
+      'uid' => array('uid'),
+    ),
+    'primary key' => array('id'),
+  );
+
+  $schema['ms_sagepay_transactions'] = array(
+    'description' => 'Holds Credit Card Transactions',
+    'fields' => array(
+      'id' => array(
+        'description' => 'The unique ID.',
+        'type' => 'serial',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'vpstxid' => array(
+        'description' => 'Unique Transaction ID from Sagepay.',
+        'type' => 'varchar',
+        'length' => '38',
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'oid' => array(
+        'description' => 'ID of the order for which this record stores details.
+          If this is a REPEAT transaction, then the order ID of the original transaction.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'payment_profile_id' => array(
+        'description' => 'ID of the payment profile used for this transaction.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'currency' => array(
+        'type' => 'varchar',
+        'description' => 'Currency Code.',
+        'length' => MAX_Currency,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'amount' => array(
+        'type' => 'numeric',
+        'description' => 'Amount of the transaction.',
+        'precision' => '10',
+        'scale' => '2',
+        'not null' => TRUE
+      ),
+      'vendortxcode' => array(
+        'type' => 'varchar',
+        'description' => 'Unique VendorTxCode for this transaction, generated by us. If this is a REPEAT, it will be different from the VendorTxCode of the Original transaction.',
+        'length' => MAX_VendorTxCode,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'securitykey' => array(
+        'description' => 'A Security key from Sagepay, used to generate an MD5 Hash to sign the Notification message.',
+        'type' => 'varchar',
+        'length' => '10',
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'txauthno' => array(
+        'description' => 'Unique Authorisation Code from Sagepay for a successfully authorised transaction; relates to VPSAuthCode from the issuing bank.',
+        'type' => 'int',
+        'size' => 'big',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+    ),
+    'primary key' => array('id'),
+    'unique keys' => array(
+      'vpstxid' => array('vpstxid'),
+      'vendortxcode' => array('vendortxcode'),
+    ),
+  );
+
+  return $schema;
+}
+
+// ======================================
+// Updates:
+// ======================================
+
+/**
+ * Implements hook_enable()
+ * 
+ * Recreates tables, during development
+ */
+
+function ms_sagepay_enable() {
+  // Get schema definition for this module
+  $schema = ms_sagepay_schema();
+  // Create the selected tables from the schema definition  
+  #db_drop_table  ('ms_sagepay_payment_profiles');
+  #db_create_table('ms_sagepay_payment_profiles', $schema['ms_sagepay_payment_profiles']);
+  #db_drop_table  ('ms_sagepay_transactions');
+  #db_create_table('ms_sagepay_transactions', $schema['ms_sagepay_transactions']);
+}
+

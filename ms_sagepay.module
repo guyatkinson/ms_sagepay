@@ -1,0 +1,2538 @@
+<?php
+// $Id$
+
+/**
+ * @file
+ * MoneyScripts SagePay Server Gateway Module
+ * Developed by Guy Atkinson, with parts copied with thanks from the ms_cres gateway module.
+ */
+
+ 
+/**
+ * Display help and module information
+ */
+function ms_sagepay_help($path, $arg) {
+  $output = '';
+  switch ($path) {
+    case "admin/moneyscripts/gateways/ms_sagepay":
+    case "admin/help#ms_sagepay":
+      $output .= '<p>' .  t("SagePay Payment Gateway Module for MoneyScripts. This allows you to 
+      receive payments using your SagePay Account, via SagePay Server. This gateway supports both Recurring and Non-Recurring
+      Orders, including via Paypal. ") . '</p>';
+      $output .= '<p>' .  t("It does not store any confidential credit card information on your site,
+      and in that regard is intended to enable your system to be PCI DSS Compliant at level 4 (the least onerous level).
+      It can charge recurring payments using a customer payment profile via Cron.
+      It also allows users to make future purchases easily from your site using a payment profile, without needing to enter their payment details again.") . '</p>';
+      $output .= '<p>' .  t("We recommend to have your server be SSL enabled, for customer confidence and because of SagePay's notification callbacks.") . '</p>';
+      $output .= '<p>' .  t("If your website sells to the UK only, you can change the country settings: 
+      MS Core Settings->Checkout Settings->Checkout Form Fields->Disable State, Default country=UK, Zip code -> Postcode") . '</p>';
+      break;
+  }
+  return $output;
+}
+
+/**
+ * Determine if the user should be able to access the modify page
+ *
+ * @param $oid
+ * @param $id
+ */
+function ms_sagepay_modify_test($oid, $id) {
+  global $user;
+  $order = ms_core_order_load($oid);
+  if (user_access('administer moneyscripts orders') OR ($user->uid == $order->uid)) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Determine if the user should be able to access the cancel page
+ *
+ * @param $oid
+ */
+function ms_sagepay_cancel_test($oid) {
+  global $user;
+  $order = ms_core_order_load($oid);
+  if (user_access('administer moneyscripts orders') OR ($user->uid == $order->uid)) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Check if the user should have access to remove or make default the payment profiles
+ */
+function ms_sagepay_card_admin_access_test($id) {
+  global $user;
+  $payment_profile = ms_sagepay_get_payment_profile($id);
+
+  return (($user->uid == $payment_profile->uid) OR user_access('administer moneyscripts settings'));
+}
+
+/**
+ * Checks to see if a user can add a card for the specified account
+ */
+function ms_sagepay_add_card_access_test($account) {
+  global $user;
+  
+  return (($user->uid AND ($user->uid == $account->uid)) OR user_access('administer moneyscripts settings'));
+}
+
+/**
+ * Checks to see if the Sagepay server can do the notification callback
+ */
+function ms_sagepay_notification_access_test($order) {
+  $cart = ms_core_get_cart();
+  $mode = ms_core_variable_get('ms_sagepay_transaction_mode', 'live', $cart);
+  if ($mode == 'simulator') {
+      return TRUE;
+  }
+  // TODO check IP is from Sagepay; 
+  return TRUE;
+}
+
+/**
+ * Checks to see if a user can access the test page
+ */
+function ms_sagepay_test_access_test($order) {
+  global $user;
+  $cart = ms_core_get_cart();
+  $mode = ms_core_variable_get('ms_sagepay_transaction_mode', 'live', $cart);
+  if ($mode == 'live') return FALSE;
+  if (!isset($_GET['fn'])) return FALSE;
+  if (user_access('administer moneyscripts orders') OR ($user->uid == $order->uid)) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+
+/**
+ * Implements hook_menu().
+ * 
+ * If you make changes here during development, then clear the menu cache (e.g. drush @server cc all)
+ */
+function ms_sagepay_menu() {
+  require_once DRUPAL_ROOT . '/' . drupal_get_path('module', 'ms_sagepay') . '/includes/ms_sagepay_constants.php';
+
+  $items = array();
+
+  $items['ms/checkout/ms_sagepay'] = array(
+    'title' => 'Checkout',
+    'page callback' => 'ms_sagepay_checkout',
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms/checkout/ms_sagepay/validated/%ms_core_order_key'] = array(
+    'title' => 'Checkout', 
+    'page callback' => 'ms_sagepay_checkout_validated',
+    'page arguments' => array(4),
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_CALLBACK,
+  );
+  $items['ms_sagepay/notification/%ms_core_order_key'] = array(
+    'page callback' => 'ms_sagepay_notification',
+    'page arguments' => array(2),
+    'access callback' => 'ms_sagepay_notification_access_test',
+    'access arguments' => array(2),
+   'type' => MENU_CALLBACK,
+  );
+  $items['ms_sagepay/thank-you'] = array(
+    'title' => 'Thank You',
+    'page callback' => 'ms_sagepay_thankyou_page',
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_sagepay/card_added'] = array(
+    'title' => 'Card Added',
+    'page callback' => 'ms_sagepay_card_added_page',
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_sagepay/template'] = array(
+    'title' => 'Checkout',
+    'page callback' => 'ms_sagepay_template_page',
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_sagepay/cancel/%'] = array(
+    'title' => 'Cancel Payments',
+    'page callback' => 'ms_sagepay_cancel_page',
+    'page arguments' => array(2),
+    'access callback' => 'ms_sagepay_cancel_test',
+    'access arguments' => array(2),
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_sagepay/modify/%/%'] = array(
+    'title' => 'Modify Payments',
+    'page callback' => 'ms_sagepay_modify_page',
+    'page arguments' => array(2, 3),
+    'access callback' => 'ms_sagepay_modify_test',
+    'access arguments' => array(2, 3),
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_sagepay/add_card/%user'] = array(
+    'title' => 'Add Card',
+    'page callback' => 'ms_sagepay_add_card_jump_page',
+    'page arguments' => array(2),
+    'access callback' => 'ms_sagepay_add_card_access_test',
+    'access arguments' => array(2),
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_sagepay/remove_card/%'] = array(
+    'title' => 'Remove Card',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ms_sagepay_remove_card_confirm', 2),
+    'access callback' => 'ms_sagepay_card_admin_access_test',
+    'access arguments' => array(2),
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_sagepay/set_default_card/%'] = array(
+    'title' => 'Set Default Card',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ms_sagepay_set_default_card_confirm', 2),
+    'access callback' => 'ms_sagepay_card_admin_access_test',
+    'access arguments' => array(2),
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['admin/moneyscripts/gateways/ms_sagepay'] = array(
+    'title' => 'SagePay',
+    'description' => 'Set the various SagePay Gateway Settings here',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ms_sagepay_admin'),
+    'access arguments' => array('administer moneyscripts settings'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+  $items['ms_sagepay/test/%ms_core_order_key'] = array(
+    'title' => 'SagePay Tests',
+    'description' => 'Test SagePay Gateway',
+    'page callback' => 'ms_sagepay_test',
+    'page arguments' => array(2),
+    'access callback' => 'ms_sagepay_test_access_test',
+    'access arguments' => array(2),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function ms_sagepay_cron() {
+#TODO must run as admin; see http://drupal.org/node/218104  Safely Impersonating Another User // Leighton
+
+  // Process recurring payments
+  $result = db_query("SELECT * FROM {ms_recurring_schedules} WHERE gateway = :gateway AND status = :status AND next_payment != 0 AND next_payment < :next_payment",
+   array(':gateway' => 'ms_sagepay', ':status' => 'active', ':next_payment' => REQUEST_TIME));
+   // Leighton: some modules set ':next_payment' twice
+
+  // Add a counter so that only a certain number of payments are processed each cron run
+  $count = 0;
+
+  $cart = ms_core_get_cart();
+  foreach ($result as $recurring_schedule) {
+    $count += 1;
+    if ($count > ms_core_variable_get('ms_sagepay_cron_number', 3, $cart)) {
+      break;
+    }
+    ms_sagepay_cron_process_payment($recurring_schedule);
+  }
+}
+
+/**
+ * Processes a payment.
+ * This function is separate from ms_sagepay_cron, so it can be tested.
+ */
+function ms_sagepay_cron_process_payment($recurring_schedule) {
+    $response = array('approved' => FALSE, 'message' => '');
+    // Load some variables
+    $order = ms_core_order_load($recurring_schedule->oid);
+    $account = user_load($order->uid);
+    // If a user has more than one recurring payment, they will all be charged on the default payment profile (even if the user specified otherwise)
+    $payment_profile = ms_sagepay_get_default_payment_profile($order->uid);
+    $cart = ms_core_get_cart();
+
+    if ($payment_profile) {
+      // Charge the recurring payment
+      $response = ms_sagepay_charge($order, $recurring_schedule->main_amount, $payment_profile);
+
+      $payment = ms_core_new_payment($order->oid, 'ms_sagepay', 'rec_payment');
+      $payment->currency = $order->currency;
+      $payment->data = $response['data'];
+      $payment->transaction = $response['data']['VendorTxCode'];
+      $payment->recurring_schedule = $order->recurring_schedule;
+      $payment->recurring_id = "ms_sagepay-" . $order->oid;   // Leighton: added this line (see other modules)
+      
+      // Update the address
+      $payment->billing_address = $payment_profile->billing_address;
+      $payment->shipping_address = $payment->billing_address;
+      
+      // Update the contact details
+      $payment->first_name = $payment_profile->first_name;
+      $payment->last_name = $payment_profile->last_name;
+      
+      if ($response['approved']) {
+        ms_core_log('ms_sagepay', 'Processing Recurring Charge for Order #!num. Here are the details: @message',  
+            array('!num' => $order->oid, '@message' => ms_core_print_r($recurring_schedule)));
+        $payment->amount = $recurring_schedule->main_amount;
+
+        // Add the rec_payment Payment to the Order
+        ms_core_enter_payment($payment, FALSE);
+
+        // If the recurring_schedule is done, send rec_eot
+        if ($recurring_schedule->total_occurrences != 0 AND $recurring_schedule->total_occurrences <= ($recurring_schedule->current_payments + 1)) {
+          $payment->type = 'rec_eot';
+          $payment->amount = 0;
+          ms_core_enter_payment($payment, FALSE);
+        }
+      }
+      else {
+        // Log the error
+        ms_core_log_error('ms_sagepay', 'Error Processing Charge: @message',  
+          array('@message' => $response['message']));
+        
+        // If the failed payments counter is greater than or equal to the allowed number, cancel the order, send rec_failed
+        if ($recurring_schedule->failed_payments >= ms_core_variable_get('ms_sagepay_retry_attempts', 3, $cart)) {
+          // Insert the rec_failed Payment to the database
+          $payment->type = 'rec_failed';
+
+          // Add the Payment to the Order
+          ms_core_enter_payment($payment, FALSE);
+          $response['message'] .= t(" rec_failed (n attempts).");
+        }
+        else {
+          // Email the User with the error details and instruct them to update their card
+          if (ms_core_variable_get('ms_sagepay_billing_error_body', '', $cart)) {
+            $vars = array(
+              'payment_profile' => $payment_profile,
+            );
+            drupal_mail('ms_sagepay', 'billing_error', $account->mail, language_default(), $vars);
+          }
+
+          // Mark the recurring_schedule next_payment date in 3 days
+          db_update('ms_recurring_schedules')
+            ->fields(array(
+                      'next_payment' => strtotime('+3 days', $recurring_schedule->next_payment),
+                    ))
+            ->condition('id', $recurring_schedule->id)
+            ->execute();
+          
+          // Increment the Failed Payments counter
+          db_update('ms_recurring_schedules')
+            ->fields(array(
+                      'failed_payments' => $recurring_schedule->failed_payments + 1,
+                    ))
+            ->condition('id', $recurring_schedule->id)
+            ->execute();
+          $response['message'] .= t(" Payment failed.");
+          // If a subsequent payment succeeds, ms_core clears the failed_payments counter
+        }
+      }
+    }
+    else {
+      // Log the error
+      ms_core_log_error('ms_sagepay', 'Error Loading Payment Profile for Recurring Payment: @recurring_schedule',  
+        array('@recurring_schedule' => ms_core_print_r($recurring_schedule)));
+      
+      // Email the User with the error details and instruct them to update their card
+      if (ms_core_variable_get('ms_sagepay_billing_error_body', '', $cart)) {
+        $vars = array(
+          'payment_profile' => $payment_profile,
+        );
+        drupal_mail('ms_sagepay', 'billing_error', $account->mail, language_default(), $vars);
+      }
+
+      // Mark the recurring_schedule next_payment date in 3 days
+      db_update('ms_recurring_schedules')
+        ->fields(array(
+              'next_payment' => strtotime('+3 days', $recurring_schedule->next_payment),
+            ))
+        ->condition('id', $recurring_schedule->id)
+        ->execute();
+      
+      // Increment the Failed Payments counter
+      db_update('ms_recurring_schedules')
+        ->fields(array(
+              'failed_payments' => $recurring_schedule->failed_payments + 1,
+            ))
+        ->condition('id', $recurring_schedule->id)
+        ->execute();
+      $response['approved'] = FALSE;
+      $response['message'] = t("Error: no payment profile.");
+    }
+    return $response;
+}
+
+// ======================================
+// Administration Page:
+// ======================================
+
+
+/**
+ * Admin Settings Form
+ */
+function ms_sagepay_admin($form, &$form_state) {
+  $form['api'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('API Credentials'),
+    '#description' => t('This information is required to interact with your payment gateway account.'),
+  );
+  $form['api']['ms_sagepay_api_vendor'] = array(
+    '#type' => 'textfield',
+    '#size' => MAX_Vendor,
+    '#maxlength' => MAX_Vendor,
+    '#title' => t('Your Vendor Name with SagePay'),
+    '#default_value' => variable_get('ms_sagepay_api_vendor', ''),
+  );
+  $form['api']['ms_sagepay_api_website_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Your short Website identifier (optional)'),
+    '#description' => t('If you have (or plan to have) more than one website or business using one SagePay Vendor account, it will help you manage transactions if you put a short form (eg 2 or 3 characters) of its name for use in each transaction code (VendorTxCode), which has a maximum length of 40. This field is optional.'),
+    '#default_value' => variable_get('ms_sagepay_api_website_id', ''),
+  );
+  $form['api']['ms_sagepay_transaction_mode'] = array(
+    '#type' => 'radios',
+    '#title' => t('SagePay Transaction Mode'),
+    '#description' => t('Use test or simulator mode for testing the gateway.'),
+    '#options' => array(
+      'live' => t('Live transactions in a live account'),
+      'test' => t('Test account associated with the live account'),
+      'simulator' => t('Developer simulator account'),
+    ),
+    '#default_value' => variable_get('ms_sagepay_transaction_mode', 'live'),
+  );
+  
+  $form['general'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('General Settings'),
+  );
+  $form['general']['ms_sagepay_show_gateway'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Show SagePay Gateway Option on Checkout Page?'),
+    '#default_value' => variable_get('ms_sagepay_show_gateway', TRUE),
+  );
+  $form['general']['ms_sagepay_allowed_cards'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Allowed Cards'),
+    '#description' => t('As of Feb 2012, Discover, Maestro, JCB & Laser
+do not support REPEAT payments, which are needed for recurring charges or for payment profiles.
+This likely applies to these card companies irrespective of which gateway company you use.</br>
+If you have more than one website, one on which you intend never to use automated recurring charges
+and one taking recurring charges, then see the code for how to set this up.'),
+    // In the case of Maestro at least, this is because they require 3dSecure on every transaction.
+    // If you have more than one website, one on which you intend never to use automated recurring charges
+    //   and one taking recurring charges, then you can ask Sagepay set up 2 merchant accounts
+    //   (which can both be to the same merchant bank account),
+    //   one with    continuous authority ('AccountType' = 'C') which would exclude Discover, Maestro, etc, and
+    //   one without continuous authority ('AccountType' = 'E') which could include Discover, Maestro, etc.
+    '#options' => array(
+      'visa' => 'Visa',
+      'mc' => 'MasterCard',
+      'amex' => 'American Express',
+      'paypal' => 'PayPal'
+    ), 
+     // 
+    '#default_value' => variable_get('ms_sagepay_allowed_cards', array(
+      'visa' => 'Visa',
+      'mc' => 'MasterCard',
+      'amex' => 'American Express',
+      'paypal' => 'PayPal'
+    )),
+  );
+  $form['general']['ms_sagepay_default_language'] = array(
+    '#type' => 'select',
+    '#title' => t('Language'),
+    '#options' => array(
+      'english' => t('English'),
+    ),
+    '#default_value' => variable_get('ms_sagepay_default_language', 'english'),
+  );
+  $form['general']['ms_sagepay_template_page_text'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Template Page Text'),
+    '#description' => t('Enter the HTML you want to show at the top of the Credit Card Form.'),
+    '#default_value' => variable_get('ms_sagepay_template_page_text', t('Please complete your payment below. This is a secure payment page.')),
+  );
+
+  $form['recurring'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Recurring Payments Settings'),
+  );
+  $form['recurring']['ms_sagepay_retry_attempts'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Retry Attempts'),
+    '#description' => t('How many times should the system retry charging a card? If a scheduled charge fails, the user is notified that they need to update their billing information, and the order is scheduled to be charged again in 3 days.'),
+    '#default_value' => variable_get('ms_sagepay_retry_attempts', 3),
+  );
+  $form['recurring']['ms_sagepay_cron_number'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Number of Payments Processed During Cron'),
+    '#description' => t('How many recurring payments to process during each cron run? Be careful of setting too many, as this could lead to a timeout.'),
+    '#default_value' => variable_get('ms_sagepay_cron_number', 30),
+  );
+
+  $form['email'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Email Settings'),
+    '#collapsible' => FALSE,
+    '#collapsed' => FALSE,
+  );
+
+  $form['email']['ms_sagepay_card_update_confirm_subject'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Card Updated Confirmation Email Subject'),
+    '#required' => FALSE,
+    '#default_value' => variable_get('ms_sagepay_card_update_confirm_subject', t("Billing Information Changed")),
+  );
+  $form['email']['ms_sagepay_card_update_confirm_body'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Card Updated Confirmation Email Body'),
+    '#description' => t("Leave blank to not send an email."),
+    '#required' => FALSE,
+    '#default_value' => variable_get('ms_sagepay_card_update_confirm_body', t("Your billing information has been successfully updated.
+
+Sincerely,
+Site Admin")),
+  );
+  $form['email']['ms_sagepay_card_update_confirm_token_help'] = array(
+    '#title' => t('Replacement patterns'),
+    '#type' => 'fieldset',
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+  );
+  $form['email']['ms_sagepay_card_update_confirm_token_help']['tokens'] = array(
+    '#theme' => 'token_tree',
+    '#token_types' => array('ms_sagepay_payment_profile', 'user'),
+  );
+
+  $form['email']['ms_sagepay_billing_error_subject'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Card Billing Error Email Subject'),
+    '#required' => FALSE,
+    '#default_value' => variable_get('ms_sagepay_billing_error_subject', t("There was a problem when processing your credit card.")),
+  );
+  $form['email']['ms_sagepay_billing_error_body'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Card Billing Error Email Body'),
+    '#description' => t("Leave blank to not send an email."),
+    '#required' => FALSE,
+    '#default_value' => variable_get('ms_sagepay_billing_error_body',
+t("Your credit card [ms_sagepay_payment_profile:cardType] ...[ms_sagepay_payment_profile:...cardLast4Digits] could not be processed. To avoid interruption of service, please update your billing information here: [ms_sagepay_payment_profile:updateUrl]
+
+Sincerely,
+Site Admin")),
+  );
+  $form['email']['ms_sagepay_billing_error_token_help'] = array(
+    '#title' => t('Replacement patterns'),
+    '#type' => 'fieldset',
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+  );
+  $form['email']['ms_sagepay_billing_error_token_help']['tokens'] = array(
+    '#theme' => 'token_tree',
+    '#token_types' => array('ms_sagepay_payment_profile', 'user'),
+  );
+
+  return system_settings_form($form);
+}
+
+// ======================================
+// User Hooks
+// ======================================
+
+
+/**
+ * Implements hook_user_cancel().
+ */
+function ms_sagepay_user_cancel($edit, $account, $method) {
+  //Remove the Records
+  db_delete('ms_sagepay_payment_profiles')
+    ->condition('uid', $account->uid)
+    ->execute();
+
+  return;
+}
+
+/**
+ * Implements hook_user().
+ */
+function ms_sagepay_user_OLD($type, &$edit, &$account, $category = NULL) { }
+
+/********************************************************************
+ * FUNCTIONS
+ *******************************************************************/
+
+/**
+ * Create a Payment Profile
+ */
+function ms_sagepay_create_payment_profile($uid, $first_name, $last_name, $billing_address,
+         $card_type, $card_last_4_digits, $original_vendortxcode) {
+  $payment_profile = new stdClass();
+
+  $payment_profile->uid = $uid;
+  $payment_profile->default = 0;
+  $payment_profile->first_name = $first_name;
+  $payment_profile->last_name = $last_name;
+  $payment_profile->billing_address = $billing_address;
+  $payment_profile->card_type = $card_type;
+  $payment_profile->card_last_4_digits = $card_last_4_digits;
+  $payment_profile->original_vendortxcode = $original_vendortxcode;
+
+  $user_name = user_load($uid)->name;
+  ms_core_log('ms_sagepay', t('Creating a new Payment Profile for :user_name.',
+    array(':user_name' => $user_name)));
+
+  $result = drupal_write_record('ms_sagepay_payment_profiles', $payment_profile);
+
+  // Set this as the new default
+  ms_sagepay_set_default_payment_profile($payment_profile);
+
+  return array('status' => ($result != FALSE), 'payment_profile' => $payment_profile);
+}
+
+/**
+ * Set a default payment profile
+ */
+function ms_sagepay_set_default_payment_profile($payment_profile) {
+  // First, set all profiles as non-default
+  db_update('ms_sagepay_payment_profiles')
+    ->fields(array(
+      'is_default' => 0,
+    ))
+    ->condition('uid', $payment_profile->uid)
+    ->execute();
+
+  // Next, set the profile with $id to be the default
+  db_update('ms_sagepay_payment_profiles')
+    ->fields(array(
+      'is_default' => 1,
+    ))
+    ->condition('id', $payment_profile->id)
+    ->execute();
+
+  return;
+}
+
+/**
+ * Load a payment profile by id
+ */
+function ms_sagepay_get_payment_profile($id) {
+  $result = db_query("SELECT * FROM {ms_sagepay_payment_profiles} WHERE id = :id", array(':id' => $id));
+  $payment_profile = $result->fetchObject();
+  $payment_profile->billing_address = unserialize($payment_profile->billing_address);
+  return $payment_profile;
+}
+
+/**
+ * Get the payment profiles for a user
+ */
+function ms_sagepay_get_payment_profiles($uid) {
+  $payment_profiles = array();
+  $result = db_query("SELECT * FROM {ms_sagepay_payment_profiles} WHERE uid = :uid ORDER BY is_default DESC", array(':uid' => $uid));
+
+  foreach ($result as $payment_profile) {
+    $payment_profiles[$payment_profile->id] = t('Credit Card: @number',
+      array('@number' => display_card_details($payment_profile)));
+  }
+
+  return $payment_profiles;
+}
+
+/**
+ * Get the default payment profile for a user
+ */
+function ms_sagepay_get_default_payment_profile($uid) {
+  $result = db_query("SELECT * FROM {ms_sagepay_payment_profiles} WHERE uid = :uid AND is_default = :default", array(':uid' => $uid, ':default' => 1));
+  $payment_profile = $result->fetchObject();
+  $payment_profile->billing_address = unserialize($payment_profile->billing_address);
+  return $payment_profile;
+}
+
+/**
+ * Update a payment profile
+ */
+function ms_sagepay_update_payment_profile($payment_profile) {
+  return drupal_write_record('ms_sagepay_payment_profiles', $payment_profile, 'id');
+}
+
+/**
+ * Delete a payment profile
+ */
+function ms_sagepay_delete_payment_profile($id) {
+  return db_delete('ms_sagepay_payment_profiles')
+    ->condition('id', $id)
+    ->execute();
+}
+
+/**
+ * Create a transaction
+ */
+function ms_sagepay_create_transaction($transaction) {
+  //TODOLATER check uniqueness of vendortxcode
+  return drupal_write_record('ms_sagepay_transactions', $transaction);
+}
+
+/**
+ * Get a transaction by VPSTxId, else returns FALSE
+ * NB fetchAssoc returns the field names in lower case
+ */
+function ms_sagepay_get_transaction($VPSTxId) {
+  $result = db_query("SELECT * FROM {ms_sagepay_transactions} WHERE VPSTxId = :VPSTxId", array(':VPSTxId' => $VPSTxId));
+  return $result->fetchAssoc();
+}
+
+/**
+ * Get a transaction by vendorTxCode, else returns FALSE
+ * NB fetchAssoc returns the field names in lower case
+ */
+function ms_sagepay_get_transaction_by_vendortxcode($vendortxcode) {
+  $result = db_query("SELECT * FROM {ms_sagepay_transactions} WHERE vendortxcode = :vendortxcode",
+    array(':vendortxcode' => $vendortxcode));
+  return $result->fetchAssoc();
+}
+
+/**
+ * Update a transaction
+ */
+function ms_sagepay_update_transaction($transaction) {
+  return drupal_write_record('ms_sagepay_transactions', $transaction, 'id');
+}
+
+
+/**
+ * Implements hook_ms_payment_gateway().
+ */
+function ms_sagepay_ms_payment_gateway($cart) {
+  $title = t('SagePay');
+  $title .= '<br /><span style="padding-left: 5.5em;">' . t('<b>Includes:</b>');
+  $title .= ms_core_get_cc_images(ms_core_variable_get('ms_sagepay_allowed_cards', array(
+    'visa' => 'Visa',
+    'mc' => 'MasterCard',
+    'amex' => 'American Express',
+    //'discover' => 'Discover',
+    'paypal' => 'PayPal',
+  ), $cart));
+
+  $gateways[] = array(
+    'name' => 'SagePay',
+    'description' => $title,
+    'module' => 'ms_sagepay',
+    'path' => 'ms/checkout/ms_sagepay',
+    'cancel_url' => 'ms_sagepay_get_cancel_url',
+    'modify_url' => 'ms_sagepay_get_modify_url',
+    'billing_url' => '',
+    'recurring' => TRUE,
+    'cart' => TRUE,
+    'active' => ms_core_variable_get('ms_sagepay_show_gateway', TRUE, $cart),
+  );
+
+  return $gateways;
+}
+
+/**
+ * Implements hook_ms_core_billing_info_alter().
+ *
+ * This will show the user's payment profiles in the user account
+ */
+function ms_sagepay_ms_core_billing_info_alter(&$html, $account) {
+	  $html['ms_sagepay'] = array(
+	    '#type' => 'fieldset',
+	    '#title' => t('Accounts'),
+	    '#description' => t('View your saved accounts. !add_card_link', 
+	      array('!add_card_link' => l(t('Add a card'), 'ms_sagepay/add_card/' . $account->uid))),
+	  );
+	
+	  // Show a table of the saved profiles, with actions such as 'Set as Default' and 'Delete'
+	  $header[] = array('data' => t('Account'));
+	  $header[] = array('data' => t('Expiration'));
+	  $header[] = array('data' => t('Status'));
+	  $header[] = array('data' => t('Actions'));
+	  
+	  $result = db_query('SELECT * FROM {ms_sagepay_payment_profiles} WHERE uid = :uid ORDER BY is_default DESC', array(':uid' => $account->uid));
+	  $rows = array();
+	  foreach ($result as $row) {
+	  	$actions = array();
+	    if (!$row->is_default) {
+	      $actions[] = l(t('Make Default'), "ms_sagepay/set_default_card/" . $row->id, array('query' => drupal_get_destination()));
+	      $actions[] = ' ' . l(t('Delete'), "ms_sagepay/remove_card/" . $row->id, array('query' => drupal_get_destination()));
+	      $status = t('Backup');
+	    }
+	    else {
+	    	$status = t('Default');
+	    }
+	
+	    $rows[] = array(display_card_details($row), $status, implode(' | ', $actions));
+	  }
+	
+	  if (count($rows)) {
+	    $html['ms_sagepay']['ms_sagepay_payment_profiles'] = array(
+	      '#type' => 'item',
+	      '#markup' => theme('table', array('header' => $header, 'rows' => $rows)),
+	    );
+	  }
+}
+
+/**
+ * Redirect to the add card jump page
+ */
+function ms_sagepay_add_card_form_submit($form, &$form_state) {
+  global $user;
+  drupal_goto('ms_sagepay/add_card/' . $user->uid);
+}
+
+/**
+ * Get the Cancellation URL for a recurring order
+ */
+function ms_sagepay_get_cancel_url($order) {
+  return 'ms_sagepay/cancel/' . $order->oid;
+}
+
+/**
+ * Initiate a cancellation
+ */
+function ms_sagepay_cancel_page($oid) {
+  return drupal_get_form('ms_sagepay_cancel_confirm', $oid);
+}
+
+/**
+ * Initiate a cancellation
+ */
+function ms_sagepay_cancel_confirm($form, &$form_state, $oid) {
+  $order = ms_core_order_load($oid);
+  $form['#ms_core_oid'] = $order->oid;
+  $redirect = (isset($_GET['destination'])) ? $_GET['destination'] : '';
+  return confirm_form($form, t("Are you sure you want to cancel your order?"), $redirect,
+                             t("This action cannot be undone."), t("Confirm"));
+}
+
+/**
+ * Cancels an order
+ */
+function ms_sagepay_cancel_confirm_submit($form, &$form_state) {
+  $order = ms_core_order_load($form['#ms_core_oid']);
+
+  // Enter the rec_cancel payment
+  $payment = ms_core_new_payment($order->oid, 'ms_sagepay', 'rec_cancel');
+  
+  $payment->transaction = 'none'; // TODO check if need unique ID
+  $payment->currency = $order->currency;
+  $payment->recurring_schedule = $order->recurring_schedule;
+  $payment->recurring_id = "ms_sagepay-" . $order->oid; // Leighton: prepending with "ms_sagepay-" . (see other modules)
+  $payment->billing_address = $order->billing_address;
+  $payment->shipping_address = $order->shipping_address;
+
+  ms_core_enter_payment($payment, FALSE);
+
+  $redirect = (isset($_GET['destination'])) ? $_GET['destination'] : '';
+  $form_state['redirect'] = $redirect;
+}
+
+/**
+ * Get the Modification URL for a recurring order
+ */
+function ms_sagepay_get_modify_url($order, $id) {
+  return 'ms_sagepay/modify/' . $order->oid . '/' . $id;
+}
+
+/**
+ * Initiate a modification
+ */
+function ms_sagepay_modify_page($oid, $id) {
+  return drupal_get_form('ms_sagepay_modify_confirm', $oid, $id);
+}
+
+/**
+ * Initiate a cancellation for CIM
+ */
+function ms_sagepay_modify_confirm($form, &$form_state, $oid, $id) {
+  $order = ms_core_order_load($oid);
+  $new_product = ms_core_load_module_product(ms_core_get_order_module($order), $id);
+  $form['#ms_core_oid'] = $order->oid;
+  $form['#ms_core_id'] = $id;
+  $redirect = (isset($_GET['destination'])) ? $_GET['destination'] : '';
+  return confirm_form($form, t("Are you sure you want to change your order to %new_prod?", array('%new_prod' => $new_product->name)), $redirect, t('This action cannot be undone.'), t('Confirm'));
+}
+
+/**
+ * Attempt to modify the order
+ */
+function ms_sagepay_modify_confirm_submit($form, &$form_state) {
+  $approved = TRUE;
+  $amount = 0;
+
+  // Load the order and products
+  $order = ms_core_order_load($form['#ms_core_oid']);
+  $account = user_load($order->uid);
+
+  $new_product = ms_core_load_module_product(ms_core_get_order_module($order), $form['#ms_core_id']);
+
+  // Remove trial periods if any from modifications
+  $new_product->recurring_schedule['has_trial'] = FALSE;
+  $new_product->recurring_schedule['trial_length'] = 0;
+
+  // Remove any coupons from the order
+  ms_core_remove_order_adjustments($order);
+
+  if ($amount = $new_product->recurring_schedule['main_amount']) {
+    if (isset($order->data['residual_credit']) AND $credit = $order->data['residual_credit']) {
+      $amount -= $credit;
+    }
+
+    if ($amount > 0) {
+      // Load the payment profile
+      $payment_profile = ms_sagepay_get_default_payment_profile($order->uid);
+
+      $response = ms_sagepay_charge($order, number_format($amount,2,'.',''), $payment_profile);
+
+      if ($response['approved']) {
+        ms_core_log('ms_sagepay', 'Processing Modified Recurring Charge for Order #!num. Here are the details: @message',  
+            array('!num' => $order->oid, '@message' => ms_core_print_r($new_product->recurring_schedule)));
+      }
+      else {
+        $approved = FALSE;
+        
+        // Log the error
+        ms_core_log_error('ms_sagepay', 'Error Processing Charge: @message',  
+          array('@message' => $response['message']));
+      }
+    }
+  }
+#drupal_set_message(/*ms_core_print_r($order).*/"amt=".$amount, 'warning', FALSE); //TMP
+
+  if ($approved) {
+    $data['new_product'] = $new_product;
+
+    $order = ms_core_add_data($order, $data);
+
+    // Enter the rec_modify payment
+    $payment = ms_core_new_payment($order->oid, 'ms_sagepay', 'rec_modify');
+    
+    if (isset($response['data']['VendorTxCode'])) $payment->transaction = $response['data']['VendorTxCode']; // Leighton: if downgrade membership, $response is undefined;  also doesn't change mem level, ignores VAT, displays negative amount 'charged' and doesn't adjust next payment (NB there may still be +ve credit in 1 or more months)
+    $payment->amount = $amount;
+    $payment->currency = $order->currency;
+    $payment->data = array('new_product' => $new_product);
+    $payment->recurring_schedule = $new_product->recurring_schedule;
+    $payment->billing_address = $order->billing_address;
+    $payment->shipping_address = $order->shipping_address;
+    $payment->recurring_id = "ms_sagepay-" . $order->oid; // Leighton: prepending with "ms_sagepay-" . (see cres line 948)
+
+    ms_core_enter_payment($payment, FALSE);
+
+    $redirect = (isset($_GET['destination'])) ? $_GET['destination'] : 'ms/thankyou';
+    $form_state['redirect'] = $redirect;
+  }
+  else {
+    drupal_set_message(t("There was an error processing your payment. Please update your billing information and try again."), 'error');
+    $form_state['redirect'] = 'user/' . $account->uid;
+  }
+}
+
+/**
+ * Confirm if the user wants to delete payment profile
+ */
+function ms_sagepay_remove_card_confirm($form, &$form_state, $id) {
+  $payment_profile = ms_sagepay_get_payment_profile($id);
+  $form['#ms_sagepay_payment_id'] = $payment_profile->id;
+  $redirect = (isset($_GET['destination'])) ? $_GET['destination'] : '';
+  return confirm_form($form, t("Are you sure you want to delete the saved payment method: @card?",  
+    array('@card' => display_card_details($payment_profile))),  
+    $redirect, t("This action cannot be undone."), t('Confirm'));
+}
+
+/**
+ * Delete a payment profile
+ */
+function ms_sagepay_remove_card_confirm_submit($form, &$form_state) {
+  $payment_profile = ms_sagepay_get_payment_profile($form['#ms_sagepay_payment_id']);
+
+  ms_sagepay_delete_payment_profile($payment_profile->id);
+
+  $redirect = (isset($_GET['destination'])) ? $_GET['destination'] : '';
+  $form_state['redirect'] = $redirect;
+}
+
+/**
+ * Confirm if the user wants to set a default card
+ */
+function ms_sagepay_set_default_card_confirm($form, &$form_state, $id) {
+  $payment_profile = ms_sagepay_get_payment_profile($id);
+  $form['#ms_sagepay_payment_id'] = $payment_profile->id;
+  $redirect = (isset($_GET['destination'])) ? $_GET['destination'] : '';
+  return confirm_form($form, t("Are you sure you want to set @card as the default payment method?",  
+    array('@card' => display_card_details($payment_profile))),  
+    $redirect, t("Future payments will be charged to this account."), t('Confirm'));
+}
+
+/**
+ * Set the default payment profile
+ */
+function ms_sagepay_set_default_card_confirm_submit($form, &$form_state) {
+  $payment_profile = ms_sagepay_get_payment_profile($form['#ms_sagepay_payment_id']);
+
+  ms_sagepay_set_default_payment_profile($payment_profile);
+
+  $redirect = (isset($_GET['destination'])) ? $_GET['destination'] : '';
+  $form_state['redirect'] = $redirect;
+}
+
+function display_card_details($payment_profile) {
+  return ($payment_profile->card_type . ' ...' . $payment_profile->card_last_4_digits);
+}
+
+/********************************************************************
+ * Checkout Form
+ *******************************************************************/
+
+/**
+ * Ask the user whether use a pre-saved Payment Profile or be redirected to SagePay to add a card
+ */
+function ms_sagepay_checkout() {
+  $build = array();
+  // Don't cache this page
+  $GLOBALS['conf']['cache'] = FALSE;
+
+// TODO check that we get the order, if coming back for retry (either new card/can use same)
+
+  $mode = variable_get('ms_sagepay_transaction_mode', 'live');
+  if ($mode != 'live') {
+    $message = "Using " . $mode . " mode. Cards will not be charged.";
+    if ($mode == 'test')  $message .= "Use one of the specific test card numbers from SagePay.";
+      drupal_set_message(t($message), 'status', FALSE);
+  } 
+
+  if (isset($_GET['msg'])) {
+#print_r($_GET);
+    $error_message = ($mode == 'live' ? '' : $_GET['msg'] . ' ') . t(ms_sagepay_user_message($_GET['msg'])) . "<br/>\n";
+    $error_message .= ($_GET['sc'] == 1 ? t("Please check your details & try again. You can use either the same card, or a different one.") 
+      : t("The card was not authorised by the bank. Please try again with a different card."));
+    drupal_set_message(t($error_message), 'error', FALSE);
+  } else {
+    drupal_get_messages('error', TRUE);  // Clear error messages
+  }
+  
+  global $user;
+
+  if (!$order = ms_core_load_session_order()) {
+    return t('There was an error with the checkout.');
+  }
+  
+  $use_new = FALSE;
+  if (arg(3) == 'new') {
+    $use_new = TRUE;
+  }
+  elseif ($order->status != 'checkout') {
+    // The order is not in checkout and shouldn't be here
+    return t('This order has already been through Checkout. Order status=:status', array(':status' => $order->status));
+  }
+
+  // Check if the user has a saved payment profile
+  if (!$use_new AND $user->uid AND $payment_profile = ms_sagepay_get_default_payment_profile($user->uid)) {
+    // Show the form to use the saved profile
+    $build['content'] = drupal_get_form('ms_sagepay_checkout_saved_profile_form', $user, $order);
+  }
+  else {
+    // Get the Payment Form
+    $build['content'] = drupal_get_form('ms_sagepay_checkout_form', $order);
+  }
+
+  return $build;
+}
+
+// TODO add custom validation for chars, length
+
+/**
+ * Build form to collect the order information
+ *
+ * @param $order
+ */
+function ms_sagepay_checkout_form($form, &$form_state, $order) {
+  $form = array();
+  
+  ms_core_get_cc_form($form, $order, array(), FALSE);
+  
+  ms_core_get_billing_form($form, $order);
+  
+  $form['#validate'][] = 'ms_core_cc_form_validate';  // TODO custom validation
+
+  $form['billing']['billing_address1']['#size']=100; #size=32 #maxlength=64
+  $form['billing']['billing_address2']['#size']=100; 
+  
+  //TEMP for testing
+  $form['cc']['cc_first_name']['#default_value']='f';
+  $form['cc']['cc_last_name']['#default_value']='s';
+  $form['billing']['billing_address1']['#default_value']='88';
+  $form['billing']['billing_city']['#default_value']='c';
+  $form['billing']['billing_zip']['#default_value']='412';
+//dprint_r($form);
+//dprint_r($order);
+
+  $form['ms_oid'] = array(
+    '#type' => 'value',
+    '#value' => $order->oid,
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Continue'),
+  );
+
+  return $form;
+}
+
+/**
+ * Submit handler for the checkout form
+ * 
+ * Saves the order, then redirects to the validated page
+ */
+function ms_sagepay_checkout_form_submit($form, &$form_state) {
+  $v = $form_state['values'];
+  $order = ms_core_order_load($v['ms_oid']);
+  
+  // Set the values from the form into the order
+  $order->first_name    = truncate($v['cc_first_name'], MAX_Firstnames);
+  $order->last_name     = truncate($v['cc_last_name'], MAX_Surnames);
+  $order->email_address = truncate($v['billing_email'], MAX_Email);
+  $order->billing_address['street']  = truncate($v['billing_address1'], MAX_Address1);
+  $order->billing_address['city']    = truncate($v['billing_city'], MAX_City);
+  $order->billing_address['state']   = truncate($v['billing_state'], MAX_State);
+  $order->billing_address['zip']     = truncate($v['billing_zip'], MAX_PostCode);
+  $order->billing_address['country'] = truncate($v['billing_country'], MAX_Country);
+  $order->billing_address['phone']   = truncate($v['billing_phone'], MAX_Phone);
+  
+  // Save the order
+  ms_core_order_save($order);
+  
+  // Redirect to the validated page
+  $form_state['redirect'] = 'ms/checkout/ms_sagepay/validated/' . $order->order_key;
+}
+
+
+
+function ms_sagepay_checkout_validated($order) {
+  $build = array();
+  $build['ms_sagepay_message'] = array(
+    '#markup' => variable_get('ms_sagepay_jump_page_text', t("Please wait for a few seconds; your order is being processed and you will be redirected to a secure payment page.
+<br/><br/>
+If you are not automatically redirected to the secure payment page within 5 seconds, click below:
+<br/><br/>")),
+  );  //TODO If needed, put a URL &  n seconds as a var, else remove
+
+  $build['ms_sagepay_checkout_validated_form'] = drupal_get_form('ms_sagepay_checkout_validated_form', $order);
+
+  // Add in the JS
+  $timeout = variable_get('ms_sagepay_jump_page_timeout', 0) * 1000;
+  $js = "
+    (function ($) {
+    window.setTimeout(function() {
+      $('#sagepay-secure-jump').submit();
+    }, $timeout);
+    })(jQuery);
+  ";
+  drupal_add_js($js, array('type' => 'inline', 'scope' => 'footer'));
+  return $build;
+}
+
+/**
+ * Prepare the form items to pass them to SagePay
+ * 
+ * The form has been validated for required fields.
+ **/
+function ms_sagepay_checkout_validated_form($form, &$form_state, $order) {
+//TODO refactor most of this down to above ms_sagepay_charge
+  $request = array();
+  $post_response = array();
+  $transaction = array();
+  
+  // TODO if free trial, AUTH
+  //      if nonfree trial, correct amount
+  //      if cart??
+/*
+   switch ($order->order_type) {
+    case 'recurring':
+      // Check if there is a free trial
+      if ($order->recurring_schedule['trial_length'] AND !$order->recurring_schedule['trial_amount']) {
+		// Do AUTH for 'main_amount' - check it goes to issuing bank
+        // In Notif: Insert a rec_signup payment without charging
+        // In Notif: Insert the rec_payment to the database for the Free Trial  (no amount)
+        // Check Thankyou page info
+..
+      }
+      else {
+        // Check if there is a trial
+        $amount = ($order->recurring_schedule['trial_length']) ? $order->recurring_schedule['trial_amount'] : $order->recurring_schedule['main_amount'];
+        // In Notif: Charge the first payment, and enter rec_signup and rec_payment
+      }
+    case 'cart':
+ 
+*/   
+  // Prepare the variables for Sagepay
+  $request['BillingFirstnames'] = $order->first_name;
+  $request['BillingSurname'] = $order->last_name;
+  $request['BillingAddress1'] = $order->billing_address['street'];
+  $request['BillingAddress2'] = '';  // TODO Form is asking for it (from ms_cres?) yet ms_core doesn't have fld for it; see ms_cres; Ask Leighton
+  $request['BillingCity'] = $order->billing_address['city'];
+  $request['BillingState'] = $order->billing_address['state'];  // optional for billing_address outside USA; required for USA
+  $request['BillingPostCode'] = $order->billing_address['zip'];
+  $request['BillingCountry'] = $order->billing_address['country'];
+  $request['BillingPhone'] = $order->billing_address['phone'];
+  $request['DeliveryFirstnames'] = $order->first_name;
+  $request['DeliverySurname'] = $order->last_name;
+  $request['DeliveryAddress1'] = $order->billing_address['street'];
+  $request['DeliveryAddress2'] = '';  // optional
+  $request['DeliveryCity'] = $order->billing_address['city'];
+  $request['DeliveryState'] = $order->billing_address['state'];
+  $request['DeliveryPostCode'] = $order->billing_address['zip'];
+  $request['DeliveryCountry'] = $order->billing_address['country'];
+  $request['CustomerEMail'] = $order->email_address;  // optional; if present, its format is validated by Sagepay
+
+  //TEMP . $order-> .. ?  Can set 'https' => FALSE for simulator
+  //TODO create alias ms_core_order_unique_key_load(), so can use unique_key here
+  $request['NotificationURL'] = url('ms_sagepay/notification/' . $order->order_key, array('absolute' => TRUE, 'https' => FALSE/*TODO TRUE*/)); 
+
+  $request['AccountType'] = 'C';   // Use the continuous authority merchant account
+  $request['BillingAgreement'] = 1;  // In case user chooses Paypal, this is first in a series of PayPal payments
+  $request['TxType'] = 'PAYMENT';
+  $url = ms_sagepay_server_url('PAYMENT');
+  $request['Currency'] = $order->currency;
+  $request['Amount'] = $order->amount;
+  $request['Description'] =  preg_replace('/&pound;/', chr(163), ms_core_get_order_title($order, MAX_Description));
+  // $request['Basket'] =  
+  $request['VendorTxCode'] = ms_sagepay_generate_VendorTxCode(); 
+#dprint_r($request);
+
+  //TODO do we need this? If not, how stop spoofing?
+  //http://blog.httpwatch.com/2009/02/20/how-secure-are-query-strings-over-https/
+  // Set the user id to be passed to the template page
+  if ($order->uid) {
+    // Set a cache marker so that users can't use this to spoof accounts
+    $cid = drupal_get_token(serialize($request));
+    cache_set($cid, $order->uid);
+    $request['sess_id'] = $cid;
+    $request['sess_name'] = 'ms_sagepay_sess';
+  }
+
+  //TODOLATER: atomically create transaction to ensure vendortxcode is unique
+  $post_response = ms_sagepay_curl_process($url, $request);
+#print "url='$url'; request=";
+#print_r($request);
+#dprint_r($post_response);
+  if (isset($post_response['Status']) AND $post_response['Status'] == 'OK') {
+	//TODOLATER: OK REPEATED
+    $transaction['oid'] = $order->oid;
+    $transaction['vendortxcode'] = trim($request['VendorTxCode']);
+    $transaction['vpstxid'] = trim($post_response['VPSTxId']);
+    $transaction['securitykey'] = trim($post_response['SecurityKey']);
+    $transaction['currency'] = $order->currency;
+    $transaction['amount'] = $order->amount;
+    #$transaction['first_name'] = $order->first_name;
+    #$transaction['last_name'] = $order->last_name;
+    #$transaction['billing_address'] = $order->billing_address;
+    // Save the transaction for the notification and thankyou_page to use
+    ms_sagepay_create_transaction($transaction);
+#dprint_r($transaction);
+
+    // After the user has filled in their credit card details on the Sagepay page,
+    //   Sagepay does a callback to the NotificationURL, which is handled by ms_sagepay_notification()
+    //   This passes RedirectURL back to Sagepay which redirects the user to there.
+    
+    // Redirect off-site to Sagepay
+    header('Location: ' . $post_response['NextURL']);
+    drupal_exit();
+  }
+  // TODOLATER handle error cases (can generate with invalid-format email address)
+}
+
+/**
+ * Handles callback from Sagepay to NotificationURL
+ * 
+ * Called by Sagepay while we are processing a checkout or REPEAT.
+ * If an incorrect $order->unique_key|order_key is used in the NotificationURL, it gives page not found, and does not come to this function.
+ * If we are processing a checkout, we create the payment profile here.
+ **/
+function ms_sagepay_notification ($order) {
+  //TODO $order = arg(2); // pick up unique_key, as per thank-you 
+#print_r($_GET);
+
+  ob_clean();  # Remove any header from the output buffer, so the output starts with the raw text
+
+  $data = array();
+  $extras = array();
+  
+  $status = 'OK';
+  $data['StatusDetail'] = '';
+  
+  if (!isset($order) || !isset($order->order_key)) $status = 'ERROR N10';
+  if ($status == 'OK') {
+	 if (!isset($_POST['VPSTxId']) OR !$_POST['VPSTxId']) $status = 'ERROR N21';
+  }
+
+  $VPSTxId = '';
+  if ($status == 'OK') {
+    $VPSTxId = urldecode($_POST['VPSTxId']);
+    $transaction = ms_sagepay_get_transaction($VPSTxId);
+    if (!$transaction) $status = 'ERROR N30';
+  }
+  if ($status == 'OK') {
+    if (!$transaction['securitykey']) $status = 'ERROR N40';
+  }
+  
+  if ($status == 'OK') {
+    $extras['VendorName'] = variable_get('ms_sagepay_api_vendor', '');
+    $extras['SecurityKey'] = $transaction['securitykey'];
+    $status = ms_sagepay_check_MD5($_POST, $extras);
+  }
+  
+  if ($status == 'OK' && !isset($_POST['Status'])) $status = 'ERROR N50';
+  $sagepayStatus = '';
+  if (isset($_POST['Status'])) $sagepayStatus = $_POST['Status'];
+  $sagepayStatusDetail = '';
+  if (isset($_POST['StatusDetail'])) $sagepayStatusDetail = $_POST['StatusDetail'];
+ 
+  $redirect_to_thankyou = FALSE; // If TRUE, redirect to thankyou page; else send to page to show error msg & ask to retry
+  $user_message = '';            // Error to display to the user on the redirect page
+  $retry_same_card = FALSE;      // If TRUE, can retry with same/another card; if FALSE, retry with another card
+  if ($status == 'OK') {
+    $error_code = '';
+    $error_tmp = substr($sagepayStatusDetail, 0, 4);
+    if ($error_tmp) $error_code = $error_tmp;
+
+    // Note that even for NOTAUTHED, ABORT or REJECTED, Sagepay ask us to send Status=OK.
+    //   In these cases, $redirect_to_thankyou == FALSE
+    //   TODO for ERROR (some|all)?
+    //   TODO URL of error messages doc; which $sagepayStatus does each come with? Handle more of them
+
+    switch($sagepayStatus) {
+      case 'OK':
+        case 'AUTHENTICATED':
+        case 'REGISTERED':
+          $redirect_to_thankyou = TRUE; // everything is OK; redirect to thankyou page
+          break;
+      case 'NOTAUTHED': // Not authed by Sagepay or acquiring bank; reply OK
+        switch($error_code) {
+          case 'NOTA':  // NOTAUTHED : The Authorisation has been declined by the bank. Please try ...  
+          case '2000':  // 2000 NOTAUTHED : The Authorisation was Declined by the bank. + Please use another card.
+          case 'Simu':  // Simulator example NOTAUTHED Notification Post
+          default:
+            $user_message = '001';
+            $retry_same_card = FALSE;
+            break;
+          case '2008':  // 2008 NOTAUTHED : The Transaction timed-out.
+            $user_message = '008';
+            $retry_same_card = TRUE;
+            break;
+          case '2009':	// 2009 NOTAUTHED : The network connection to the bank is currently unavailable.
+            $user_message = '009';
+            $retry_same_card = FALSE;
+            break;
+        }
+        break;
+      case 'ABORT':     // User aborted or timeout in browser: reply OK
+        $user_message = '010';
+        $retry_same_card = TRUE;
+        break;
+      case 'REJECTED':  // Rejected by our rules stored at Sagepay: reply OK;
+        $user_message = '020';
+        $retry_same_card = FALSE;
+        break;
+      case 'ERROR':     // reply INVALID; redirect; can retry
+        $user_message = '900';
+        $status = "INVALID: ERROR from Sagepay"; 
+        $retry_same_card = FALSE;
+        break;
+      default:
+        $user_message = '901';
+        $status = "INVALID: unknown Status '" . $sagepayStatus . "' from Sagepay"; 
+        $retry_same_card = FALSE;
+        break;
+    }
+  }
+  if ($redirect_to_thankyou) {
+    if ($status == 'OK') {
+      // If we are processing a checkout (new card), we create the payment profile.
+      $payment_results = ms_sagepay_create_payment_profile($order->uid,
+      $order->first_name, $order->last_name, $order->billing_address, 
+      $_POST['CardType'], $_POST['Last4Digits'], $transaction['vendortxcode']);
+      if (! $payment_results['status'])  $status = 'ERROR N50';
+    }
+    if ($status == 'OK') {
+      $payment_profile = $payment_results['payment_profile'];
+      $transaction['payment_profile_id'] = $payment_profile->id;
+    }
+    if ($status == 'OK' && isset($_POST['TxAuthNo'])) {
+	    $transaction['txauthno'] = $_POST['TxAuthNo'];
+      if (ms_sagepay_update_transaction($transaction) == FALSE)  $status = 'INVALID N60';
+    }
+  }
+
+  $data['Status'] = $status;
+  $data['StatusDetail'] = $status;
+  $data['RedirectURL'] = url('ms_sagepay/thank-you/' . $order->unique_key . '/' . $VPSTxId,
+    array('absolute' => TRUE, 'https' => TRUE));
+  if ($status !== 'OK' OR !$redirect_to_thankyou) {
+    // Redirect to page asking the user to retry with same or another card; display error message
+    if ($user_message == '') $user_message = '990';
+    $data['Status'] = preg_match('/^([A-Z]*)/', $status, $matches) ? $matches[1] : 'INVALID';
+    $data['StatusDetail'] = $user_message . ' ' . $status;
+    $data['RedirectURL'] = url('ms/checkout/ms_sagepay/' . $order->order_key,
+      array('absolute' => TRUE, 'https' => TRUE,
+      'query' => array('msg' => $user_message, 'sc' => ($retry_same_card ? 1 : 0))));
+  }
+
+  if ($status !== 'OK' OR !$redirect_to_thankyou) {
+    $vendorTxCode = isset($_POST['VendorTxCode']) ? $_POST['VendorTxCode'] : '';
+#    ms_core_log_error('ms_sagepay', "Notification Error. Sagepay sent: '@sagepayStatus', '@sagepayStatusDetail';\n",
+#        array('@sagepayStatus' => $sagepayStatus,
+#        '@sagepayStatusDetail' => $sagepayStatusDetail));
+    ms_core_log_error('ms_sagepay', "Notification Error. Sagepay sent: '@sagepayStatus', '@sagepayStatusDetail';\n" .
+      " we sent: '@ourStatus', '@ourStatusDetail';\n msg to user: '@user_message'; VendorTxCode='@vendorTxCode'",
+        array('@sagepayStatus' => $sagepayStatus,
+        '@sagepayStatusDetail' => $sagepayStatusDetail,
+        '@ourStatus' => $data['Status'],
+        '@ourStatusDetail' => $data['StatusDetail'],
+        '@user_message' =>  ms_sagepay_user_message($user_message),
+        '@vendorTxCode' => $vendorTxCode));
+  }
+  
+  // Output raw text with no html header etc
+  $text = '';
+  $keys = array('Status','RedirectURL','StatusDetail');
+  foreach ($keys as $key) {
+	$text .= $key . '=' . $data[$key] . "\r\n";  
+  }
+  print $text;
+}
+
+function ms_sagepay_user_message($num) {
+    $msgs = array(
+      '001' => "The Authorisation has been declined.",  // by the bank
+      '008' => "The network connection to the bank is temporarily not responding.",
+      '009' => "The network connection to the bank is not available.",
+      '010' => "There has been a delay, with either your browser or the network.",
+      '020' => "The Authorisation has been declined.",  // by our rules stored at Sagepay
+      '900' => "The payment gateway module has detected an error from Sagepay.",
+      '901' => "The payment gateway module has detected an error from Sagepay.",
+      '990' => "The payment gateway module has detected an error.",
+      //TODO incorrect field (by name)
+     );
+     if (isset ($msgs[$num])) return $msgs[$num];
+     return "Unknown user_message: " . $num;
+}
+  
+/**
+ * Helper to swap the name of a form field
+ */
+function ms_sagepay_change_form_field_name(&$form, $f0, $f1, $f2) {
+  if (isset($form[$f0][$f1])) {
+    $form[$f0][$f2] = $form[$f0][$f1];
+    unset($form[$f0][$f1]);
+  }
+}
+
+/**
+ * Redirect to SagePay to let the user add a card
+ */
+function ms_sagepay_add_card_jump_page($account) {
+	global $user;
+  $build = array();
+  $build['content']['ms_sagepay_add_card_header']['#markup'] = t('Please fill out the form below to add a new payment method.');
+  $build['content']['ms_sagepay_add_card_form'] = drupal_get_form('ms_sagepay_add_card_jump_page_form', $account);
+  
+  return $build;
+}
+
+/**
+ * Redirect to SagePay to let the user add a card
+ */
+function ms_sagepay_add_card_jump_page_form($form, &$form_state, $account) {
+  $form = array();
+  
+  $url = ms_sagepay_server_url('PAYMENT');
+  $form['#action'] = $url;
+  $form['#id'] = 'sagepay-secure-jump';
+  
+  $order = new stdClass();
+  $order->uid = $account->uid;
+  $order->email_address = $account->mail;
+  
+  ms_core_get_cc_form($form, $order, array(), FALSE);
+  
+  ms_core_get_billing_form($form, $order);
+
+  // Set the names of the fields to the SagePay names
+  //TODO max lengths
+  ms_sagepay_change_form_field_name($form, 'cc', 'cc_first_name', 'BillingFirstnames');
+  ms_sagepay_change_form_field_name($form, 'cc', 'cc_last_name', 'BillingSurname');
+  ms_sagepay_change_form_field_name($form, 'billing', 'billing_address1', 'BillingAddress1');
+  ms_sagepay_change_form_field_name($form, 'billing', 'billing_address2', 'BillingAddress2'); //TODO ask OK if empty?
+  ms_sagepay_change_form_field_name($form, 'billing', 'billing_city', 'BillingCity');
+  ms_sagepay_change_form_field_name($form, 'billing', 'billing_state', 'BillingState');
+  ms_sagepay_change_form_field_name($form, 'billing', 'billing_zip', 'BillingPostCode');
+  ms_sagepay_change_form_field_name($form, 'billing', 'billing_country', 'BillingCountry'); //TODO ask OK if empty?
+  ms_sagepay_change_form_field_name($form, 'billing', 'billing_phone', 'BillingPhone');
+  ms_sagepay_change_form_field_name($form, 'billing', 'billing_email', 'CustomerEMail'); // optional
+
+  $data = array();
+
+  // Add the variables
+  $data['return_url'] = url('ms_sagepay/card_added', array('absolute' => TRUE, 'https' => TRUE));
+  $data['content_template_url'] = url('ms_sagepay/template', array('absolute' => TRUE, 'https' => TRUE));
+  $data['total_amt'] = 0.00;
+  $data['order_id'] = 0;
+  $data['customer_id'] = $account->uid;
+  $data['lang'] = variable_get('ms_sagepay_default_language', 'english');
+  
+  // Set the user id to be passed to the template page
+  if ($account->uid) {
+  	// Set a cache marker so that users can't use this to spoof accounts
+  	$cid = drupal_get_token(serialize($data));
+  	cache_set($cid, $account->uid);
+    $data['sess_id'] = $cid;
+    $data['sess_name'] = 'ms_sagepay_sess';
+  }
+  
+  // Add the hidden form elements
+  foreach ($data as $key => $value) {
+    $form[$key] = array(
+      '#type' => 'hidden',
+      '#value' => $value,
+    );
+  }
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Continue'),
+  );
+  
+  $form['#validate'][] = 'ms_core_cc_form_validate';
+  
+  $_SESSION['ms_sagepay_adding_card'] = $account->uid;
+
+  return $form;
+}
+
+/**
+ * Build the Saved Profile Checkout Form
+ */
+function ms_sagepay_checkout_saved_profile_form($form, &$form_state, $account, $order) {
+  $payment_profiles = ms_sagepay_get_payment_profiles($account->uid);
+
+  $form['ms_order_contents'] = array(
+    '#type' => 'markup',
+    '#value' => ms_core_get_order_details_table($order),
+  );
+
+  $form['payment_id'] = array(
+    '#type' => 'radios',
+    '#title' => 'Payment Method',
+    '#options' => $payment_profiles,
+    '#description' => t("Select which method you'd like to use to pay for this purchase."),
+    '#default_value' => key($payment_profiles),
+    '#required' => TRUE,
+  );
+
+  $form['ms_oid'] = array(
+    '#type' => 'value',
+    '#value' => $order->oid,
+  );
+
+  $form['submit_token'] = array(
+    '#type' => 'submit',
+    '#value' => t('Pay Now'),
+    '#validate' => array('ms_sagepay_checkout_saved_profile_form_validate'),
+    '#submit' => array('ms_sagepay_checkout_saved_profile_form_submit'),
+  );
+  $form['submit_new'] = array(
+    '#type' => 'submit',
+    '#value' => t('Use a new card'),
+    '#submit' => array('ms_sagepay_checkout_new_card_form_submit'),
+    '#validate' => array('ms_sagepay_checkout_new_card_form_validate'), 
+  );
+
+  return $form;
+}
+
+/**
+ * Validate callback if the 'Add new Card' button is clicked
+ */ 
+function ms_sagepay_checkout_new_card_form_validate($form, &$form_state) {
+  drupal_get_messages('error', TRUE);  // Clear error messages  // Leighton: needed if ms_*_checkout() can ever do drupal_set_message
+}
+
+/**
+ * The user has opted to use a new card; reload the page and pass the 'new' parameter
+ */
+function ms_sagepay_checkout_new_card_form_submit($form, &$form_state) {
+  drupal_goto('ms/checkout/ms_sagepay/new');
+}
+
+/**
+ * Validate the Checkout Form, and Try to Charge the Card from the Payment Profile
+ * 
+ * TODO where is the code to handle all these diff types:
+ *  (recurring ([free] trial), cart) for new card, with[out] existing profiles?
+ *   If it's this, then need to integrate PAYMENT & REPEAT into 1 set of functions
+ */
+function ms_sagepay_checkout_saved_profile_form_validate($form, &$form_state) {
+  drupal_get_messages('error', TRUE);  // Clear error messages  // Leighton: needed if ms_*_checkout() can ever do drupal_set_message
+
+  $form_values = $form_state['values'];
+
+  $order = ms_core_order_load($form_values['ms_oid']);
+  $account = user_load($order->uid);
+  $payment_profile = ms_sagepay_get_payment_profile($form_values['payment_id']);
+
+  $OK = false;
+  switch ($order->order_type) {
+    case 'recurring':  // TODO test free trial  
+      // Check if there is a free trial
+      if ($order->recurring_schedule['trial_length'] AND !$order->recurring_schedule['trial_amount']) {
+        // Just insert a rec_signup payment without charging
+        // Insert the Payment to the database for the Free Trial
+        $payment = ms_core_new_payment($order->oid, 'ms_sagepay', 'rec_signup');
+        
+        // Generate a Unique Transaction ID
+        $payment->transaction = drupal_get_token(serialize($order));  // TODO check if need unique ID
+        $payment->currency = $order->currency;
+        $payment->data = $payment_profile;
+        $payment->recurring_schedule = $order->recurring_schedule;
+        $payment->recurring_id = "ms_sagepay-" . $order->oid;
+
+        // Update the address
+        $payment->billing_address = $payment_profile->billing_address;
+        $payment->shipping_address = $payment->billing_address;
+        
+        // Update the contact details
+        $payment->first_name = $payment_profile->first_name;
+        $payment->last_name = $payment_profile->last_name;
+
+        // Add the Payment to the Order
+        ms_core_enter_payment($payment, FALSE);
+
+        $OK = true;
+      }
+      else {
+        // Check if there is a trial
+        $amount = ($order->recurring_schedule['trial_length']) ? $order->recurring_schedule['trial_amount'] : $order->recurring_schedule['main_amount'];
+
+        // Charge the first payment, and enter rec_signup and rec_payment
+        $response = ms_sagepay_charge($order, $amount, $payment_profile);
+
+        if ($response['approved']) {
+          // Insert the rec_signup Payment to the database
+          $payment = ms_core_new_payment($order->oid, 'ms_sagepay', 'rec_signup');
+          $payment->transaction = $response['data']['VendorTxCode'];
+          $payment->currency = $order->currency;
+          $payment->data = $response['data'];
+          $payment->recurring_schedule = $order->recurring_schedule;
+          $payment->recurring_id = "ms_sagepay-" . $order->oid;
+
+          // Update the address
+          $payment->billing_address = $payment_profile->billing_address;
+          $payment->shipping_address = $payment->billing_address;
+          
+          // Update the contact details
+          $payment->first_name = $payment_profile->first_name;
+          $payment->last_name = $payment_profile->last_name;
+
+          // Add the rec_signup Payment to the Order. If it's an ms_membership order, this starts the membership.
+          ms_core_enter_payment($payment, FALSE);
+
+          // Add the rec_payment Payment to the Order
+          $payment->type = 'rec_payment';
+          $payment->amount = $amount;
+          ms_core_enter_payment($payment, FALSE);
+
+          // This card works, so use it for recurring payments  // Leighton
+          ms_sagepay_set_default_payment_profile($payment_profile);
+          $OK = true;  
+        }
+      }
+      break;
+
+    case 'cart':  // TODOLATER test
+      $response = ms_sagepay_charge($order, $order->amount, $payment_profile);
+
+      if ($response['approved']) {
+        // Insert the Payment to the database
+        $payment = ms_core_new_payment($order->oid, 'ms_sagepay', 'cart');
+        $payment->transaction = $response['data']['VendorTxCode'];
+        $payment->amount = $order->amount;
+        $payment->currency = $order->currency;
+        $payment->data = $response['data'];
+        #$payment->recurring_schedule = $order->recurring_schedule; // TODO is this right?? See other modules, incl w payment helper
+
+        // Update the address
+        $payment->billing_address = $payment_profile->billing_address;
+        $payment->shipping_address = $payment->billing_address;
+        
+        // Update the contact details
+        $payment->first_name = $payment_profile->first_name;
+        $payment->last_name = $payment_profile->last_name;
+
+        // Add the Payment to the Order
+        ms_core_enter_payment($payment, FALSE);
+        $OK = true;
+      }
+      break;
+  }
+  if ($OK) {
+     // Add the payment to the order
+     $form_state['values']['ms_oid'] = $order->oid;
+     $form_state['values']['ms_order_charged'] = TRUE;
+  } else {
+	 //TODOLATER distinguish perm errors, in which case delete the profile
+     form_set_error('payment_id', t('There was an error processing the charge. Please Use a new card.'));
+     // Log the error
+     ms_core_log_error('ms_sagepay', 'Error Processing Charge: @message', array('@message' => $response['message']));
+  }
+}
+
+/**
+ * The card has been charged; mark the order as completed
+ */
+function ms_sagepay_checkout_saved_profile_form_submit($form, &$form_state) {
+  $v = $form_state['values'];
+print ms_core_print_r($form_state);
+  // If the Order was charged, complete it
+  if ($v['ms_order_charged']) {
+    drupal_goto('ms/thankyou');  // Check compat w our thankyou page, in processing & showing to user
+  }
+  else {
+    // There was an error; go back to the form & display form_set_error message
+  }
+}
+
+// ======================================
+// MAIL
+// ======================================
+
+
+/**
+ * Handle Mail functions
+ */
+function ms_sagepay_mail($key, &$message, $seed_vars) {
+  switch ($key) {
+    case 'card_update_confirm':
+      $payment_profile = $seed_vars['payment_profile'];
+      $account = user_load($payment_profile->uid);
+
+      $subject = variable_get('ms_sagepay_card_update_confirm_subject', '');
+      $body = variable_get('ms_sagepay_card_update_confirm_body', '');
+      break;
+
+    case 'billing_error':
+      $payment_profile = $seed_vars['payment_profile'];
+      $account = user_load($payment_profile->uid);
+
+      $subject = variable_get('ms_sagepay_billing_error_subject', '');
+      $body = variable_get('ms_sagepay_billing_error_body', '');
+      break;
+  }
+  
+  // Replace the Tokens
+  $message['subject'] = token_replace($subject, 
+    array(
+      'ms_sagepay_payment_profile' => $payment_profile,
+      'user' => $account,
+      ));
+  $message['body'][] = token_replace($body, 
+    array(
+      'ms_sagepay_payment_profile' => $payment_profile,
+      'user' => $account,
+      ));
+}
+
+// ======================================
+// TOKEN
+// ======================================
+
+/**
+ * Implements hook_token_info().
+ */
+function ms_sagepay_token_info() {
+  $types = array(
+    'ms_sagepay_payment_profile' => array(
+      'name' => t('Payment Profile'),
+      'description' => t('Payment Profile Variables'),
+      'needs-data' => 'ms_sagepay_payment_profile',
+    ),
+  );
+    
+  $tokens = array(
+    'ms_sagepay_payment_profile' => array(
+      'updateUrl' => array(
+        'name' => t('Update URL'),
+        'description' => t("The URL for the update payment profile page."),
+      ),
+      'cardType' => array(
+        'name' => t('Card Type'),
+        'description' => t("Card Type"),  // eg Visa / Mastercard
+      ),
+      'cardLast4Digits' => array(
+        'name' => t('Last 4 Digits of Card'),
+        'description' => t("Last 4 Digits of Card"),
+      ),
+      'firstName' => array(
+        'name' => t('Billing First Name'),
+        'description' => t("Billing First Name"),
+      ),
+      'lastName' => array(
+        'name' => t('Billing Last Name'),
+        'description' => t("Billing Last Name"),
+      ),
+      'street' => array(
+        'name' => t('Billing Address'),
+        'description' => t("Billing Address"),
+      ),
+      'city' => array(
+        'name' => t('Billing City'),
+        'description' => t("Billing City"),
+      ),
+      'state' => array(
+        'name' => t('Billing State'),
+        'description' => t("Billing State"),
+      ),
+      'zip' => array(
+        'name' => t('Billing Zip'),
+        'description' => t("Billing Zip"),
+      ),
+      'country' => array(
+        'name' => t('Billing Country'),
+        'description' => t("Billing Country"),
+      ),
+      'phone' => array(
+        'name' => t('Billing Phone Number'),
+        'description' => t("Billing Phone Number"),
+      ),
+    ),
+  );
+  
+  return array('types' => $types, 'tokens' => $tokens);
+}
+
+/**
+ * Implements hook_tokens().
+ */
+function ms_sagepay_tokens($type, $tokens, $data = array(), $options = array()) {
+  $replacements = array();
+  
+  if ($type == 'ms_sagepay_payment_profile' && !empty($data['ms_sagepay_payment_profile'])) {
+    $object = $data['ms_sagepay_payment_profile'];
+    foreach ($tokens as $name => $original) {
+      switch ($name) {
+        case 'updateUrl':
+          $replacements[$original] = url('user/' . $object->uid . '/edit/billing-info', array('absolute' => TRUE));
+          break;
+        case 'cardType':
+          $card_type = $object->card_type;
+          switch ($card_type) {
+            case 'MC':
+              $card_type = 'MasterCard';    
+              break;
+            case 'UKE':
+              $card_type = 'Visa Electron';
+              break;
+          }
+          $replacements[$original] = $card_type;
+          break;
+       case 'cardLast4Digits':
+          $replacements[$original] = $object->card_last_4_digits;
+          break;
+       case 'firstName':
+          $replacements[$original] = $object->first_name;
+          break;
+        case 'lastName':
+          $replacements[$original] = $object->last_name;
+          break;
+        case 'street':
+          $replacements[$original] = $object->billing_address['street'];
+          break;
+        case 'city':
+          $replacements[$original] = $object->billing_address['city'];
+          break;
+        case 'state':
+          $replacements[$original] = $object->billing_address['state'];
+          break;
+        case 'zip':
+          $replacements[$original] = $object->billing_address['zip'];
+          break;
+        case 'country':
+          $replacements[$original] = $object->billing_address['country'];
+          break;
+        case 'phone':
+          $replacements[$original] = $object->billing_address['phone'];
+          break;
+      }
+    }
+  }
+
+  return $replacements;
+}
+
+/**
+ * Landing page which will add a card profile
+ */
+function ms_sagepay_card_added_page() {
+  // Check to make sure this is a valid request
+  if (!isset($_SESSION['ms_sagepay_adding_card'])) {
+  	drupal_set_title(t('Error'));
+    return t('Error, account mismatch.');
+    ms_core_log_error('ms_sagepay', t('Error, account mismatch.'));
+  }
+  
+  $account = user_load($_SESSION['ms_sagepay_adding_card']);
+  
+  unset($_SESSION['ms_sagepay_adding_card']);
+  
+  $valid_payment = ms_sagepay_validate_added_card($_GET);
+
+  // Validate the payment
+  if ($valid_payment['approved']) {
+    $data = $valid_payment['params'];
+    $cc_num = $data['mPAN'];
+    $cc_type = $data['type'];
+    $month = substr($data['exp'], 0, 2);
+    $year = substr($data['exp'], 2, 2);
+    $token = $data['CRE_Card_Token'];
+
+    $address = array(
+      'first_name' => $data['customer_firstname'],
+      'last_name' => $data['customer_lastname'],
+      'address' => $data['customer_address'],
+      'city' => $data['customer_city'],
+      'state' => $data['customer_state'],
+      'zip' => $data['customer_postal_code'],
+      'country' => $data['customer_country'],
+      'phone' => $data['customer_phone'],
+      'fax' => '',
+    );
+
+    // Create a new Payment Profile   TODO will need to go via Sagepay->Notification, which will create payment_profile
+    $payment_result = ms_sagepay_create_payment_profile($account->uid, $address, /* TODO,*/ $token);
+
+    // Set a message
+    drupal_set_message(t('Your payment information has been updated.'));
+
+    // Go to the user account page
+    drupal_goto('user');
+  }
+  else {
+    // The payment didn't pass validation, so we show an error message
+    drupal_set_message(t('The payment did not pass validation. The message returned was: @message. The error has been logged. Please contact us for more help.', 
+     array('@message' => $valid_payment['message'])));
+    //TODOLATER log error msg. Leighton
+    
+    // Go to the user account page
+    drupal_goto('user');
+  }
+}
+
+/**
+ * Landing page which will validate the order, then enter the payment
+ */
+function ms_sagepay_thankyou_page() {
+	// Check whether payment has already been stored. $transaction['payment_id'] = payment->id; if page is reloaded w incorrect info, log silently
+	//   save 3 extra flds now, w quick checks; TODOLATER careful checks
+	// TODOLATER for security, put short $order_key 1st so params don't show in browser??
+	//   Store transaction id in session?
+	// TODOLATER Flag transactions which notify OK yet don't get to thankyou page: cron report at say 4:30 M-F
+	//      Use $transaction['payment_id']
+	
+  $unique_key = arg(2);
+  $VPSTxId = arg(3);   // arg runs urldecode
+
+  // Load the order
+  if (!$order = ms_core_order_load_unique($unique_key)) {
+    // Should never get here
+    ms_core_log_error('ms_sagepay', 'The order was unable to be loaded by key: !key. Details: !values',   
+      array('!key' => $unique_key, '!values' => ms_core_print_r($_GET)));
+    return drupal_set_message(t("There was an error processing the payment. This error has been logged."), 'error', FALSE);
+  }
+
+  if (!isset($VPSTxId)) $VPSTxId = '';
+  if (($VPSTxId == '') OR !$transaction = ms_sagepay_get_transaction($VPSTxId)) {
+    //TODOLATER for security, check $transaction['payment_profile_id']->oid, 'payment_id', 'oid', uid etc
+    //  If already shown same thankyou page before & it's valid, OK; don't show error msg to user
+    //  NB must work for all cases, esp whether added card or used payment profile, esp payment_id
+    ms_core_log_error('ms_sagepay', 'The transaction was unable to be loaded by VPSTxId: !VPSTxId',   
+      array('!VPSTxId' => $VPSTxId));
+    return drupal_set_message(t("There was an error processing the payment. This error has been logged."), 'error', FALSE);
+  }
+  // Validate the payment //TODO presumably checking for new card cf saved profile (save in transaction?)
+#  if (isset($_GET['CRE_Tokenize'])) {
+#    $valid_payment = ms_sagepay_validate_added_card($_GET);  // need $transaction; can it, pp indic whether new card? Why may it matter?
+#  }
+#  else {
+#    $valid_payment = ms_sagepay_validate_payment($order, $_GET);
+#  }
+  
+//  if (TRUE||$valid_payment['approved']) {  
+//    $data = $valid_payment['params'];
+    
+    // Insert the Payment into the order
+    $payment = ms_core_new_payment($order->oid, 'ms_sagepay', 'cart');
+    $payment->transaction = $transaction['vendortxcode'];
+    $payment->amount = $order->amount;
+    $payment->currency = $order->currency;
+    $payment->data = $transaction; // NB $payment->data is normally set from $response['data'], which has keys in MixedCase, and some different fields
+    $payment->recurring_schedule = $order->recurring_schedule;
+    $payment->recurring_id = "ms_sagepay-" . $order->oid;
+
+    #$payment->first_name = $transaction['first_name']; // TODO check (new, existing card) if can take from $payment_profile
+    #$payment->last_name =  $transaction['last_name'];
+    #$payment->billing_address = $transaction['billing_address'];
+    #$payment->shipping_address = $payment->billing_address;
+
+    switch ($order->order_type) {
+      case 'recurring':
+        // Override Payment details
+        $payment->type = 'rec_signup';
+        $payment->currency = $transaction['currency'];
+        $payment->amount = $transaction['amount'];
+
+        // Add the Signup Payment
+        ms_core_enter_payment($payment, FALSE);
+        break;
+
+      case 'cart':
+        // Add the Payment to the Order
+        ms_core_enter_payment($payment);
+        break;
+    }
+#print ms_core_print_r($order);
+#print ms_core_print_r($payment);
+    
+    if ($payment->pid) {
+	  $transaction['payment_id'] = $payment->pid;
+	  ms_sagepay_update_transaction($transaction);
+	}
+/*    
+    // Create a new Payment Profile
+    if (isset($data['CRE_Card_Token'])) {
+    	// Create the Payment Profile
+	    // Reload the $order to get the user id
+	    $order = ms_core_order_load($order->oid);
+	    $account = user_load($order->uid);
+	
+	    $address = array(
+	      'first_name' => $order->first_name,
+	      'last_name' => $order->last_name,
+	      'address' => $order->billing_address['street'],
+	      'city' => $order->billing_address['city'],
+	      'state' => $order->billing_address['state'],
+	      'zip' => $order->billing_address['zip'],
+	      'country' => $order->billing_address['country'],
+	      'phone' => $order->billing_address['phone'],
+	      'fax' => '',
+	    );
+    
+    	$token = $data['CRE_Card_Token'];
+    	$payment_result = ms_sagepay_create_payment_profile($account->uid, $address, $token);
+    	
+    	// Also need to charge the payment here, since the payment won't be charged if using Tokenization
+	    if ($payment_profile = ms_sagepay_get_default_payment_profile($order->uid)) {
+	    	watchdog('ms_sagepay', t('Charging the first payment for a tokenized order.'));
+	    	
+		    // Handle Trial Periods
+		    $amount = $order->amount;
+			  if ($order->order_type == 'recurring') {
+			    if ($order->recurring_schedule['trial_length'] AND !$order->recurring_schedule['trial_amount']) {
+			      // If there is a free trial, then go straight to the thank-you page
+			      drupal_goto('ms/thankyou');
+			    }
+			    else {
+			      // Otherwise, set the amount to the trial amount if applicable
+			      $amount = ($order->recurring_schedule['trial_length']) ? $order->recurring_schedule['trial_amount'] : $order->recurring_schedule['main_amount'];
+			    }
+			  }
+        
+	    	/** 
+         * FIXME - This is failing when the user entered an incorrect billing address.
+         * We should try and charge the order before entering the payments above for signup,
+         * so that the user isn't granted a free month for products, and so that they won't
+         * be shown a success message.
+         */
+
+/*        
+	      // Process the next payment
+	      $response = ms_sagepay_charge($order, $amount, $payment_profile);
+	      
+	      if (!$response['approved']) {
+	      	// Log the failed payment
+	      	$payment->type = 'rec_failed';
+	      	
+	      	ms_core_log_error('ms_sagepay', 'A payment has failed. Details: !details', 
+            array('!details' => $response));
+	      	
+	      	ms_core_enter_payment($payment);
+	      }
+	      elseif ($order->order_type == 'recurring') {
+	      	$payment->type = 'rec_payment';
+	        $payment->amount = $amount;
+	        
+	        // Add the Payment
+	        ms_core_enter_payment($payment, FALSE);
+	      }
+	    }
+    }
+    
+    // Go to the MS thank you page
+    drupal_goto('ms/thankyou');
+  }
+  else {
+    // The payment didn't pass validation, so we show an error message
+    drupal_set_title(t('Error'));
+    
+    ms_core_log_error('ms_sagepay', 'The payment did not pass validation. The message returned was: @message. Details: !details', 
+      array('@message' => $valid_payment['message'], '!details' => ms_core_print_r($_GET)));
+    
+    return t('The payment did not pass validation. The message returned was: @message. The error has been logged. Please contact us for more help.', 
+      array('@message' => $valid_payment['message']));
+  }
+*/
+
+    // Go to the MS thank you page
+    drupal_goto('ms/thankyou');
+}
+
+/**
+ * Template page callback
+ *
+ * Notes:
+ * Must use the [[FORM INSERT]] token
+ * Must be useable via HTTPS
+ * Must have the BASE tag with the URL of your HTTPS domain or use absolute urls for CSS and image SRC values
+ * Must allow for the user session to be set via the URL
+ * <script> and <iframe> tags are stripped
+ */
+function ms_sagepay_template_page() {
+	global $user;
+	// Set the correct user if specified
+	if (isset($_GET['ms_sagepay_sess'])) {
+		if ($data = cache_get($_GET['ms_sagepay_sess'])) {
+			$uid = $data->data;
+			// Load the user
+		  $user = user_load($uid);
+		  
+		  // Remove the cached user id so it can't be used as a security loophole
+		  cache_clear_all($_GET['ms_sagepay_sess'], 'cache');
+		}
+	}
+	else {
+		// Make sure there is no user logged in
+		$user = user_load(0);
+	}
+  
+	// Add the base tag
+	$element = array(
+	  '#tag' => 'base',
+	  '#attributes' => array(
+	    'href' => url('', array('absolute' => TRUE)), 
+	  ),
+	);
+	drupal_add_html_head($element, 'ms_sagepay_template');
+	
+  $html = variable_get('ms_sagepay_template_page_text', t('Please complete your payment below. This is a secure payment page.'));
+  $html .= "<div class='cre_secure_form_wrapper'>[[FORM INSERT]]</div>";
+
+  return $html;
+}
+
+function formatDateMicroseconds($microtime, $format)
+{
+    list($timestamp, $microseconds) = explode('.', $microtime);
+    return date($format, (int)$timestamp) . '.' . $microseconds;
+}
+
+/**
+ * Generate a VendorTxCode that is unique to our vendor across all their websites
+ * Note that Sagepay's check for uniqueness is case insignificant (in Feb 2012, at least on the simulator),
+ *  so base64 won't work. We could use gmp_strval to generate base 36.
+ * Max length 40
+**/
+function ms_sagepay_generate_VendorTxCode() {
+    // TODO use variable_get('ms_sagepay_api_website_id', '')
+	return 'rt' . formatDateMicroseconds(microtime(true), 'ymdHis'); //TODO params, userID (date len: 18) max len 40
+	// No need to use '-' so rtyymmddhhmm646464uuuuuuuuuuu; do we always have unique user ID at this time?
+	// Could do a database-wide lock on this function (only for single web server); wait >>1 microseconds before & after lock&time;
+	// Ask Sagepay what details are [easily] accessable in overview, per trans: ymd hms?
+	//   assumes time doesn't change (ntp?).
+	// Could have db table indexed by VendorTxCode - do we need to look up by VendorTxCode?
+	//   Can we add any flds (eg token in other gateways) to $order?
+    // Unfortunately, [unique_key] => -t5dv2C8172v8BzxPFN2_-_iQP79ru1RW7LpeaIhRyE is case significant
+  // Append a random number to the transaction ID so that the order can be resubmitted to SagePage in the
+  // event the user clicks back to modify the order before completing. (otherwise we SagePay rejects this
+  // as a duplicate)
+  $intRandNum = rand(0, 32000) * rand(0, 32000);
+
+}
+
+// ======================================
+// SagePay Server API Calls
+// ======================================
+
+function ms_sagepay_server_url($txType) {
+  $mode = variable_get('ms_sagepay_transaction_mode', 'live');
+  switch ($txType) {
+	case 'PAYMENT':
+      switch ($mode) {	
+        case 'live':
+        case 'test':
+          return 'https://' . $mode . '.sagepay.com/gateway/service/vspserver-register.vsp';
+        case 'simulator':
+          return 'https://test.sagepay.com/Simulator/VSPServerGateway.asp?Service=VendorRegisterTx';
+      }
+	case 'REPEAT':
+      switch ($mode) {	
+        case 'live':
+        case 'test':
+          return 'https://' . $mode . '.sagepay.com/gateway/service/repeat.vsp';
+        case 'simulator':
+          return 'https://test.sagepay.com/Simulator/VSPServerGateway.asp?Service=VendorRepeatTx';
+      }
+    }
+}
+
+/**
+ * Test page for non-live modes only
+ */
+ # eg /ms_sagepay/test/K4Z3D5/?fn=REPEAT&amt=3
+function ms_sagepay_test($order) {
+  $fn = isset($_GET['fn']) ? $_GET['fn'] : '';
+  switch($fn) {
+    case 'REPEAT':
+      if (isset($_GET['amt'])) {
+        $payment_profile = ms_sagepay_get_default_payment_profile($order->uid);
+        $response = ms_sagepay_charge($order, $_GET['amt'], $payment_profile);
+        print ms_core_print_r($response);
+      }
+      break;
+    case 'cron':
+      // TODO test error cases eg by introducing a different deliberate error eg missing a param
+      print t("oid=@oid<br>\n", array('@oid' => $order->oid));
+      $result = db_query("SELECT * FROM {ms_recurring_schedules} WHERE gateway = :gateway AND oid = :oid",
+        array(':gateway' => 'ms_sagepay', ':oid' => $order->oid));
+      if (!isset($result)) {
+        print t("No results set from ms_recurring_schedules for oid = :oid</br>\n", array(':oid' => $order->oid));
+        break;
+      }
+      $numFound = 0;
+      foreach ($result as $recurring_schedule) {
+        $numFound += 1;
+        if ($recurring_schedule->status != 'active' OR $recurring_schedule->next_payment == 0) {
+          print t("recurring_schedule is not active or next_payment == 0");
+          break;
+        }
+        $result = ms_sagepay_cron_process_payment($recurring_schedule);
+        print ms_core_print_r($recurring_schedule);
+        print ms_core_print_r($result);
+      }
+      if ($numFound == 0) {
+        print t("No results found from ms_recurring_schedules for oid = :oid</br>\n", array(':oid' => $order->oid));
+        break;
+      }
+      break;
+    case 'pp': // tests payment_profile tokens
+      global $user;
+      $payment_profile = ms_sagepay_get_default_payment_profile($user->uid); // or $order->uid
+      $body = '';
+      $keys = array('updateUrl','cardType','cardLast4Digits','firstName','lastName','street','city','state','zip','country','phone');
+      foreach ($keys as $key) {
+        $body .= $key . ': [ms_sagepay_payment_profile:' . $key. "]\n";
+      }
+      //TODO look up other modules|core w text field w 'serialize' => TRUE: how read the field? Alt look up drupal docs
+      $body .= 'phone: ' . $payment_profile->billing_address['phone']. "\n"; 
+      $body .= 'payment_profile Object: ' .  ms_core_print_r($payment_profile) . "\n";
+      $body = token_replace($body, 
+        array(
+          'ms_sagepay_payment_profile' => $payment_profile,
+          'user' => $user,
+        ));
+      print ms_core_print_r($body);
+    case 'email':
+      global $user;
+      #$vars = array('payment_profile' => $payment_profile();
+      #drupal_mail('ms_sagepay', 'billing_error', $user->mail, language_default(), $vars);
+      break;
+    default:
+      print "Unrecognised fn: $fn";
+      break;
+  }
+  return;
+}
+
+/**
+ * Charge a Payment Profile with REPEAT
+ */
+function ms_sagepay_charge($order, $amount, $payment_profile) {
+  $url = ms_sagepay_server_url('REPEAT');
+  $return['data'] = '';                   // Leighton: calling code needs these 2 variables set
+  $return['data']['VendorTxCode'] = '';   //  ditto
+
+  // Build the request params
+  $request = array();
+  $request['TxType'] = 'REPEAT';  // See the Shared Protocols document
+  $request['Currency'] = $order->currency;
+  $request['Amount'] = $amount;
+  $request['Description'] = ms_core_get_order_title($order, 100); // could format this
+  $original_transaction = ms_sagepay_get_transaction_by_vendortxcode($payment_profile->original_vendortxcode);
+  $original_transactionIsOk = $original_transaction ? TRUE : FALSE;
+  if ($original_transactionIsOk) {
+    $keys = array('VPSTxId','VendorTxCode','SecurityKey','TxAuthNo');
+    $s = '';
+    foreach ($keys as $key) {
+      $value = '';
+      if (isset($original_transaction[strtolower($key)])) $value = $original_transaction[strtolower($key)];
+      if (strlen($value) > 0) {
+        $request['Related' . $key] = $original_transaction[strtolower($key)]; // e.g. RelatedVendorTxCode 
+      } else {
+        $original_transactionIsOk =	FALSE;
+	  }
+    }
+  }
+  if (!$original_transactionIsOk) {
+    $message = "REPEAT: missing or incorrect original transaction for payment_profile->id @ppid (order id = @oid).";
+    ms_core_log_error('ms_sagepay', $message, array('@ppid' => $payment_profile->id, '@oid' => $order->id));
+    $return['approved'] = FALSE;
+    $return['message'] = t($message, array('@ppid' => $payment_profile->id, '@oid' => $order->id));
+    return $return;
+  }
+  $request['VendorTxCode'] = ms_sagepay_generate_VendorTxCode(); 
+
+  $post_response = ms_sagepay_curl_process($url, $request);  // send request to Sagepay
+
+  if (empty($post_response)) {
+    ms_core_log_error('ms_sagepay', "REPEAT transaction timed out or no response was received.");
+    $return['approved'] = FALSE;
+    $return['message'] = t('REPEAT transaction timed out or no response was received.');
+  }
+  else {
+    // Determine if the transaction was a success
+    if (isset($post_response['Status'])) {
+    	if ($post_response['Status'] == 'OK') {
+          $post_response['VendorTxCode'] = trim($request['VendorTxCode']);
+          $post_response['VPSTxId'] = trim($post_response['VPSTxId']);
+          $post_response['SecurityKey'] = trim($post_response['SecurityKey']);
+          $transaction = array();
+          $transaction['oid'] = $order->oid;
+          $transaction['vendortxcode'] = trim($request['VendorTxCode']);
+          $transaction['vpstxid'] = $post_response['VPSTxId'];
+          $transaction['securitykey'] = $post_response['SecurityKey'];
+          $transaction['currency'] = $order->currency;
+          $transaction['amount'] = $amount;
+          // Save the transaction
+          ms_sagepay_create_transaction($transaction);
+
+          $return['approved'] = TRUE;
+          $return['data'] = $post_response;
+	    }
+	    else {
+	      ms_core_log_error('ms_sagepay', "REPEAT transaction: error %reasoncode: %reasondesc",   
+	        array('%reasoncode' => $post_response['Status'], '%reasondesc' => $post_response['StatusDetail']));
+	      $return['approved'] = FALSE;
+	      $return['message'] = t("REPEAT transaction: Error %reasoncode: %reasondesc",   
+	        array('%reasoncode' => $post_response['Status'], '%reasondesc' => $post_response['StatusDetail']));
+	    }
+    }
+    else {
+    	ms_core_log_error('ms_sagepay', "REPEAT transaction: Unknown Error: %post_response",   
+        array('%post_response' => ms_core_print_r($post_response)));
+      $return['approved'] = FALSE;
+      $return['message'] = t("REPEAT transaction: Unknown Error; see log for details.");
+    }
+  }
+  
+  return $return;
+}
+
+/**
+ * Make sure that a payment is valid
+ */
+ /*
+function ms_sagepay_validate_payment($order, $params) {
+  $url = ms_sagepay_server_url('TODO');  //direct/services/validation/
+  
+  // Build the request params
+  $request = array();
+  $request['total_amt'] = $order->amount;
+  $request['order_id'] = $params['order_id'];
+
+  $response = ms_sagepay_curl_process($url, $request);
+
+  if (empty($response)) {
+    ms_core_log_error('ms_sagepay', "Transaction timed out or no response received.");
+    $return['approved'] = FALSE;
+    $return['message'] = t('Transaction timed out or no response received.');
+  }
+  else {
+  	if ($response['status'] == 'success') {
+  		$params_clean = array();
+      foreach ($_GET as $key => $value) {
+        $params_clean[$key] = $value;
+      }
+
+      // The payment is valid
+      $return['approved'] = TRUE;
+      $return['data'] = $response;
+      $return['params'] = $params_clean;
+  	}
+    // Check if the payment is valid
+    elseif (isset($response['error']) AND $response['error']) {
+    	$return['approved'] = FALSE;
+      $return['message'] = t('Error validating the payment: @message',  
+        array('@message' => $response['error_message']));
+      
+      ms_core_log_error('ms_sagepay', "Error validating the payment: @message. Details: !details",   
+        array('!details' => ms_core_print_r($response), '@message' => $response['error_message']));
+    }
+    elseif ($response['order_id_match'] == 'NO' OR $response['total_amt_match'] == 'NO') {
+      $return['approved'] = FALSE;
+      $return['message'] = t('Error validating the payment: @message',  
+        array('@message' => t('Order ID or Total Amount did not match.')));
+
+      ms_core_log_error('ms_sagepay', "Error validating the payment: @message. Details: !details",   
+        array('!details' => ms_core_print_r($response), '@message' => t('Order ID or Total Amount did not match.')));
+    }
+    else {
+      $params_clean = array();
+      foreach ($_GET as $key => $value) {
+        $params_clean[$key] = $value;
+      }
+
+      // The payment is valid
+      $return['approved'] = TRUE;
+      $return['data'] = $response;
+      $return['params'] = $params_clean;
+    }
+  }
+
+  return $return;
+}
+*/
+
+/**
+ * Make sure that an added card is valid
+ */
+
+function ms_sagepay_validate_added_card($params) {
+  // Check if the payment is valid
+  if (isset($params['code']) AND $params['code'] == '000') {
+    $params_clean = array();
+    $params['VPSTxId'] = 't_'. drupal_get_token(serialize($params));
+    foreach ($params as $key => $value) {
+      $params_clean[$key] = $value;
+    }
+
+    // The payment is valid
+    $return['approved'] = TRUE;
+    $return['data'] = $params;
+    $return['params'] = $params_clean;
+  }
+  else {
+    if (!isset($params['msg'])) {
+      $params['msg'] = t('Unknown Error');
+    }
+  	$return['approved'] = FALSE;
+    $return['message'] = t('Error validating the payment: @message',  
+      array('@message' => $params['msg']));
+
+    ms_core_log_error('ms_sagepay', "Error validating the payment: @message. Details: !details",   
+      array('!details' => ms_core_print_r($params), '@message' => $params['msg']));
+  }
+
+  return $return;
+}
+
+
+function ms_sagepay_parse_query_by_lines($str) {
+	$ret = array();
+
+    $pairs = explode("\n", $str);
+
+    foreach($pairs as $pair) {
+		if (strlen($pair) == 0) break;
+        $pair_decoded = trim(urldecode($pair));
+        // The value of NextURL contains at least one raw '='
+        $ret[strstr($pair_decoded, '=', TRUE)] = preg_replace('/^=/', '', strstr($pair_decoded, '='));
+    }
+    return $ret;
+}
+
+/**
+ * Send the Server Request using cURL
+ */
+function ms_sagepay_curl_process($url, $params) {
+
+  // Set the API Credentials
+  $params['VPSProtocol'] = '2.23'; 
+  $params['Vendor'] = variable_get('ms_sagepay_api_vendor', ''); 
+ 
+  // Use cURL to send the server request
+  $ch = curl_init($url);
+  curl_setopt($ch, CURLOPT_POST, TRUE);
+  curl_setopt($ch, CURLOPT_HEADER, FALSE);
+  curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($params));
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, TRUE);
+  curl_setopt($ch, CURLOPT_TIMEOUT, 300);
+  $raw_response = curl_exec($ch);
+  curl_close($ch);
+
+  $response = array();
+  $response = ms_sagepay_parse_query_by_lines($raw_response);
+  
+  return $response;
+}
+
+function ms_sagepay_check_MD5(&$post, &$extras) {
+	//TODO Check ERROR or INVALID
+  if (!isset($post['VPSSignature'])) return "ERROR CS10: no VPSSignature";
+  if (!isset($post['VPSTxId'])) return "ERROR CS20: no VPSTxId";
+  if (!isset($post['TxAuthNo'])) $extras['TxAuthNo'] = ''; // If not authorised
+  if (!isset($post['AddressStatus'])) $extras['AddressStatus'] = ''; // Paypal only
+  if (!isset($post['PayerStatus'])) $extras['PayerStatus'] = ''; // Paypal only
+  
+  $keys = array('VPSTxId','VendorTxCode','Status','TxAuthNo','VendorName','AVSCV2','SecurityKey',
+    'AddressResult','PostCodeResult','CV2Result','GiftAid','3DSecureStatus','CAVV','AddressStatus',
+    'PayerStatus','CardType','Last4Digits');
+  $s = '';
+  $message = '';
+  foreach ($keys as $key) {
+    $value = '';
+    if (isset($post[$key])) {
+      $value = $post[$key];
+    } else {
+      if (isset($extras[$key])) {
+        $value = $extras[$key];
+      } else {  // $key is not present
+        // For test & live modes at least, CAVV is only present if the 3DSecureStatus field is OK
+        //   As of 11 May 2012, simulator returns CAVV even if 3DSecureStatus != 'OK'
+        //   server-PHP-Kit ignores missing fields and sets them to ''
+        if ($key == 'CAVV' && (!isset($post['3DSecureStatus']) || $post['3DSecureStatus'] != 'OK')) continue;
+        $message .= $key . ',';
+      }
+    }
+    $s .= $value;
+  }
+  if (strlen($message)) return "ERROR CS80: missing " .$message;
+  $strMySignature = strtoupper(md5($s));
+#return $strMySignature;
+  return (($strMySignature == $post['VPSSignature']) ? "OK" : "ERROR CS90: possible tampering - mismatched VPSSignature");
+
+}
+
+function truncate($string, $limit) {
+  return substr($string, 0, $limit); 
+}
+
+// TODO later
+//  order_key=order_number are of form Z9Z9Z9 so there are only 17M possible unique orders. Add an ms_core_order_unique_key_load->ms_core_order_load_unique()
+//     can use unique
+//     hide order|unique_key w arg(2)
+//  Check Sagepay says payment is OK before accept order:#
+//     https://www.owasp.org/index.php/Web_Parameter_Tampering, http://drupal.org/node/829412, http://drupal.org/node/829528
+//    
+// doc: 3 kinds of 'token' incl drupal_get_token to gen Unique Transaction ID
+
+// If cancel, and flag is set to cancel immediately, expiration date needs to be now, not copied from next payment
