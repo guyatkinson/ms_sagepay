@@ -20,10 +20,11 @@ function ms_sagepay_help($path, $arg) {
       receive payments using your SagePay Account, via SagePay Server. This gateway supports both Recurring and Non-Recurring
       Orders, including via Paypal. ") . '</p>';
       $output .= '<p>' .  t("It does not store any confidential credit card information on your site,
-      and in that regard is intended to enable your system to be PCI DSS Compliant at level 4 (the least onerous level).
+      and in that regard is intended to enable the possibility of your system being PCI DSS Compliant with SAQ A (the least onerous).
+      You are responsible for checking your PCI status throughout your organization, locations, infrastructure etc.
       It can charge recurring payments using a customer payment profile via Cron.
       It also allows users to make future purchases easily from your site using a payment profile, without needing to enter their payment details again.") . '</p>';
-      $output .= '<p>' .  t("We recommend to have your server be SSL enabled, for customer confidence and because of SagePay's notification callbacks.") . '</p>';
+      $output .= '<p>' .  t("We recommend that your server be SSL enabled, for customer confidence and because of SagePay's notification callbacks.") . '</p>';
       $output .= '<p>' .  t("If your website sells to the UK only, you can change the country settings: 
       MS Core Settings->Checkout Settings->Checkout Form Fields->Disable State, Default country=UK, Zip code -> Postcode") . '</p>';
       break;
